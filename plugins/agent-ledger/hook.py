@@ -93,7 +93,7 @@ def announce(root):
     if new:
         shown[root] = max(a['o']['t_ms'] for a in new)
         (HOME / 'shown.json').write_text(json.dumps(shown))
-        check = f"python3 '{Path(__file__).resolve().with_name('reconcile.py')}' --diff"
+        check = f"python3 '{Path(__file__).resolve().with_name('reconcile.py')}' --home '{HOME}' --project '{root}' --diff"
         print(json.dumps({'systemMessage': f'Agent Ledger: {len(new)} new alert(s) in this project. Details and restore lines: '
                                            f'/agent-ledger:check in Claude Code, or {check}\n' + '\n'.join(map(r.headline, new))}))
 
