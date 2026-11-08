@@ -98,8 +98,12 @@ func record(_ path: String, kind: String, flags: [String] = []) {
         // a sweep hashes only what changed since it was last hashed: every write moves ctime, and nothing sets it back
         if kind == "checkpoint", let t = hashedAt[path], t.tv_sec == st.st_ctimespec.tv_sec, t.tv_nsec == st.st_ctimespec.tv_nsec { return }
         hashedAt[path] = st.st_ctimespec
+    } else if errno != ENOENT {
+        return  // it can't be looked at, which is not evidence that it is gone
     }
-    let s = snapshot(path), sha = s?.sha ?? ""  // "" once it no longer exists
+    let s = snapshot(path)
+    if s == nil, lstat(path, &st) == 0 { return }  // there but unreadable: neither a deletion nor a change
+    let sha = s?.sha ?? ""  // "" once it no longer exists
     guard sha != (last[path] ?? "") else { return }  // unchanged since the last record
     last[path] = sha
     var o: [String: Any] = ["kind": kind, "path": path, "flags": flags]

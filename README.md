@@ -40,6 +40,8 @@ stale write wouldn't, so it stays an alert, labelled `git-index`.
 - **Overlapping shell work.** Two agents running shell commands in one folder at the same time can cover each other's
   writes, because a shell write is attributed to the call whose time window it falls in.
 - **Fast or large writes.** Two writes within about 50 ms keep only the last version. Files over 64 MB are not tracked.
+- **Files it can't read.** A file the watcher can't read is skipped, never recorded as deleted, so its content isn't
+  vouched for while it stays unreadable.
 
 ## Alerts
 
