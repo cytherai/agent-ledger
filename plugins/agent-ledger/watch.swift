@@ -6,6 +6,10 @@
 // recorded as "vcs" markers (no content), so the reconciler can recognise git operations; nothing else under .git is
 // tracked. When FSEvents reports dropped events (MustScanSubDirs), the subtree
 // is rescanned ("rescan") and the gap is recorded ("gap").
+// Once a minute, and after the startup comparison, it sweeps each project: it compares every file whose ctime moved
+// since it was last hashed with its last recorded version, and records what the event stream missed ("checkpoint").
+// Then it records a "heartbeat" for the project saying whether the folder could be read. An unreadable folder is
+// not swept, so a folder the watcher cannot see never looks like files were deleted.
 // Files over 64 MB, and anything under .build, node_modules or __pycache__, are not tracked. HOME is owner-only (0700).
 // One watcher per HOME: it holds an exclusive lock on HOME/watch.lock, and a second one exits at once. It watches the
 // projects listed in HOME/roots (ROOT arguments are added there), and a project appended later joins without a gap:
@@ -42,9 +46,10 @@ let maxBytes: off_t = 64 << 20
 try FileManager.default.createDirectory(at: versions, withIntermediateDirectories: true, attributes: ownerOnly)
 if !FileManager.default.fileExists(atPath: log.path) { FileManager.default.createFile(atPath: log.path, contents: nil) }
 var last: [String: String] = [:]  // path -> sha256 of its last recorded version ("" when deleted)
+var hashedAt: [String: timespec] = [:]  // path -> its ctime when last hashed
 for line in (try String(contentsOf: log, encoding: .utf8)).split(separator: "\n") {
     let o = try JSONSerialization.jsonObject(with: Data(line.utf8)) as! [String: Any]
-    if !["vcs", "gap"].contains(o["kind"] as! String) { last[o["path"] as! String] = o["sha256"] as? String ?? "" }
+    if !["vcs", "gap", "heartbeat"].contains(o["kind"] as! String) { last[o["path"] as! String] = o["sha256"] as? String ?? "" }
 }
 let out = try FileHandle(forWritingTo: log)
 out.seekToEndOfFile()
@@ -88,7 +93,12 @@ func record(_ path: String, kind: String, flags: [String] = []) {
         return
     }
     var st = stat()
-    if lstat(path, &st) == 0, st.st_mode & S_IFMT != S_IFREG || st.st_size > maxBytes { return }  // not a tracked file
+    if lstat(path, &st) == 0 {
+        if st.st_mode & S_IFMT != S_IFREG || st.st_size > maxBytes { return }  // not a tracked file
+        // a sweep hashes only what changed since it was last hashed: every write moves ctime, and nothing sets it back
+        if kind == "checkpoint", let t = hashedAt[path], t.tv_sec == st.st_ctimespec.tv_sec, t.tv_nsec == st.st_ctimespec.tv_nsec { return }
+        hashedAt[path] = st.st_ctimespec
+    }
     let s = snapshot(path), sha = s?.sha ?? ""  // "" once it no longer exists
     guard sha != (last[path] ?? "") else { return }  // unchanged since the last record
     last[path] = sha
@@ -109,10 +119,20 @@ func scan(_ root: String, kind: String) {
     }
 }
 
-for root in roots { scan(root, kind: "startup") }  // anything new or different since the last run
-for (path, sha) in last where !sha.isEmpty && roots.contains(where: { path.hasPrefix($0 + "/") }) && !FileManager.default.fileExists(atPath: path) {
-    record(path, kind: "startup")  // deleted while stopped
+/// Compares each readable project with its last records, deletions included, then records a heartbeat per project.
+func sweep(kind: String) {
+    for root in roots {
+        let readable = (try? FileManager.default.contentsOfDirectory(atPath: root)) != nil
+        if readable {
+            scan(root, kind: kind)
+            for (path, sha) in last where !sha.isEmpty && path.hasPrefix(root + "/") && !FileManager.default.fileExists(atPath: path) {
+                record(path, kind: kind)  // deleted unseen
+            }
+        }
+        write(["kind": "heartbeat", "path": root, "readable": readable])
+    }
 }
+sweep(kind: "startup")  // anything new, different or gone since the last run
 
 let names: [(Int, String)] = [(kFSEventStreamEventFlagItemCreated, "Created"), (kFSEventStreamEventFlagItemRemoved, "Removed"),
     (kFSEventStreamEventFlagItemRenamed, "Renamed"), (kFSEventStreamEventFlagItemModified, "Modified"),
@@ -160,6 +180,7 @@ rootsChanged.resume()
 let began = Date(), idle = DispatchSource.makeTimerSource(queue: queue)
 idle.schedule(deadline: .now() + 60, repeating: 60)
 idle.setEventHandler {
+    sweep(kind: "checkpoint")
     let claims = home.appendingPathComponent("claims.jsonl").path
     let lastClaim = (try? FileManager.default.attributesOfItem(atPath: claims))?[.modificationDate] as? Date ?? began
     if Date().timeIntervalSince(max(lastClaim, began)) > idleSeconds { exit(0) }

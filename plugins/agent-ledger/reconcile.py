@@ -12,7 +12,8 @@ Alerts:
 - REVERTED: such a change made by a call that named the file (an Edit, Write or patch of it).
   Both list every call that named the file while it held the returning content: who had seen that version.
 - UNWATCHED: a change made while the watcher was stopped, found at its next start; it cannot be attributed.
-- PARTIAL: a change found by rescanning after the operating system dropped events; it cannot be attributed.
+- PARTIAL: a change found by rescanning after the operating system dropped events, or by the watcher's minutely
+  checkpoint after the event stream missed it; it cannot be attributed.
 Not alerts:
 - Git operations (shown as GIT and counted). Within 2 s of the change, either:
   - a reflog moved and the file now holds what that move promises: a new HEAD entry, the file's content at the new
@@ -24,14 +25,14 @@ Not alerts:
   changed and git stores the content: possibly your own restore).
 - Paths git ignores (`git check-ignore`).
 Paths are compared as the file system compares them: Unicode NFC, and without case on a case-insensitive volume.
-Each alert states its evidence: hook-claim, time-window, provenance, rescan, git-index, or none. Provenance counts only
+Each alert states its evidence: hook-claim, time-window, provenance, rescan, checkpoint, git-index, or none. Provenance counts only
 when a stamp appeared or changed with this version, and names an app, never a session: a copy carries its source's
 stamp. An unclaimed change's writer is "not established". Each alert names the change it undid, and a one-line restore
 of the version before it, which refuses if the file changed after the alert. With --explain, Claude writes an
 incident report for each alert from its first line, content and restore lines and diff; it is never told the writer,
 who saw the version, or the change undone. That sends file contents to Anthropic's API (ANTHROPIC_API_KEY), after
 keys, tokens and passwords are redacted on this machine.
-Usage: reconcile.py [--home DIR] [--project DIR] [--diff] [--explain]
+Usage: reconcile.py [--home DIR] [--project DIR] [--at MS] [--diff] [--explain]
        reconcile.py [--home DIR] --restore PATH EXPECTED VERSION
 """
 import argparse
@@ -45,6 +46,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import unicodedata
 import urllib.error
 import urllib.request
@@ -53,6 +55,7 @@ from pathlib import Path
 
 GRACE_MS = 2000
 VCS_WINDOW_MS = 2000
+STALE_MS = 150_000  # the watcher sends a heartbeat every 60 s; none for this long means it isn't running
 GIT_WRITES = re.compile(r'\bgit\s+(?:-C\s+\S+\s+)?(?:checkout|restore|reset|stash|switch|rebase|merge|pull|cherry-pick|revert|am|apply)\b')
 READ_ONLY = {'Read', 'Glob', 'Grep', 'LS', 'WebFetch', 'WebSearch'}  # Claude Code tools that cannot write a file
 MARKERS = {'ChatGPT app (Codex)': '~/.codex/logs_2.sqlite'}  # a file only that app writes: its stamp names the app
@@ -203,8 +206,27 @@ def new_stamp(o, previous):
 def evidence(o, by, previous):
     basis = ['hook-claim' if names(by, o['path']) else 'time-window'] if by else []
     basis += ['provenance'] if new_stamp(o, previous) else []
-    basis += ['rescan'] if o['kind'] in ('startup', 'rescan') else []
+    basis += {'startup': ['rescan'], 'rescan': ['rescan'], 'checkpoint': ['checkpoint']}.get(o['kind'], [])
     return basis or ['none']
+
+
+def coverage(observations, root, at):
+    """How far the watcher vouches for `root` as of `at` (ms): (start, end, reason). Each heartbeat follows a sweep
+    that compared every file with its last record, and says whether the folder could be read. The span ends at the
+    last heartbeat and starts after the last gap or unreadable beat before it. `reason` is None when the span reaches
+    `at` with the folder readable; otherwise it says why coverage is unknown since `end`."""
+    beats = sorted((o for o in observations if o['kind'] == 'heartbeat' and o['t_ms'] <= at and under(root + '/', o['path'])),
+                   key=lambda o: o['t_ms'])
+    if not beats:
+        return None, None, 'the watcher has recorded no heartbeat here'
+    if not beats[-1]['readable']:
+        return None, beats[-1]['t_ms'], 'the watcher could not read the folder'
+    start = beats[-1]
+    for b in reversed(beats[:-1]):
+        if start['t_ms'] - b['t_ms'] > STALE_MS or not b['readable']:
+            break
+        start = b
+    return start['t_ms'], beats[-1]['t_ms'], 'no heartbeat since: the watcher is not running' if at - beats[-1]['t_ms'] > STALE_MS else None
 
 
 def reconcile(observations, claims, home=None):
@@ -213,7 +235,7 @@ def reconcile(observations, claims, home=None):
     markers = [{'root': os.path.dirname(os.path.dirname(o['path'])), 't_ms': o['t_ms']} for o in observations
                if o['kind'] == 'vcs' and o['path'].endswith('/.git/index')]
     moves = reflog_moves(observations, home) if home else []
-    files = [o for o in observations if o['kind'] in ('startup', 'change', 'rescan')]
+    files = [o for o in observations if o['kind'] in ('startup', 'change', 'rescan', 'checkpoint')]
     skip = ignored({o['path'] for o in files})
     tool_calls, history, alerts = calls(claims), {}, []
     for o in sorted((o for o in files if o['path'] not in skip), key=lambda o: o['t_ms']):
@@ -223,7 +245,7 @@ def reconcile(observations, claims, home=None):
         kinds = []
         if o['kind'] == 'change' and by is None:
             kinds.append('UNCLAIMED')
-        if o['kind'] in ('startup', 'rescan') and before:
+        if o['kind'] in ('startup', 'rescan', 'checkpoint') and before:
             kinds.append('UNWATCHED' if o['kind'] == 'startup' else 'PARTIAL')
         spans = [(p['t_ms'], (before + [o])[i + 1]['t_ms']) for i, p in enumerate(before[:-1])
                  if o.get('sha256') is not None and p.get('sha256') == o['sha256']]
@@ -372,14 +394,14 @@ def main():
     p.add_argument('--restore', nargs=3, metavar=('PATH', 'EXPECTED', 'VERSION'),
                    help=f'put the kept VERSION back at PATH, only if PATH still has the hash EXPECTED ({ABSENT} if deleted)')
     p.add_argument('--project', default='/', help='only alerts under this folder; exits 1 if nothing was ever recorded under it')
+    p.add_argument('--at', type=int, help='judge coverage as of this time, in ms since the epoch (default: now)')
     a = p.parse_args()
     home = Path(a.home)
     if a.restore:
         return restore(home, *a.restore)
     labels = {stamp(os.path.expanduser(marker)): name for name, marker in MARKERS.items() if os.path.exists(os.path.expanduser(marker))}
     observations, project = load(home / 'observations.jsonl'), os.path.realpath(a.project)
-    times = [o['t_ms'] for o in observations if under(o['path'], project)]
-    if not times:  # there "0 alerts" would read as an all-clear
+    if not any(under(o['path'], project) for o in observations):  # there "0 alerts" would read as an all-clear
         raise SystemExit(f'nothing recorded under {project} on this machine, so no alert there means nothing. The watcher '
                          "runs only on macOS, needs swiftc for its first start, and needs the app's access to the folder; "
                          f'see {home / "watch.log"}.')
@@ -389,8 +411,14 @@ def main():
         print(f"--explain: sending {len(alerts)} alert(s) to Anthropic's API; keys, tokens and passwords are redacted first", file=sys.stderr)
     report(alerts, labels, home, a.diff, a.explain)
     print(f'{len(alerts)} alert(s); {len(found) - len(alerts)} change(s) made by git')
-    print(f'Recorded under {project} from {clock(min(times))} to {clock(max(times))}: a watcher records each start and '
-          'each change. A change after that, or one made and undone while no watcher ran, is not in this ledger.')
+    start, end, why = coverage(observations, project, round(time.time() * 1000) if a.at is None else a.at)
+    print(f"State: {'ALERTS_PRESENT' if alerts else 'COVERAGE_UNKNOWN' if why else 'NO_ALERTS_OBSERVED'} under {project}.")
+    if start is not None:
+        print(f'Covered from {clock(start)} to {clock(end)}: each minute the watcher could read the folder and compared '
+              'every file with its last record. A change made and undone between two comparisons, if the event stream '
+              'missed it, is not in this ledger.')
+    if why:
+        print(f"Coverage unknown{f' since {clock(end)}' if end else ''}: {why}.")
 
 
 if __name__ == '__main__':

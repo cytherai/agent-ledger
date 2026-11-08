@@ -34,8 +34,9 @@ stale write wouldn't, so it stays an alert, labelled `git-index`.
 
 - **Who wrote a change no agent claimed.** The writer is "not established". If a macOS provenance stamp appeared with
   the change, the alert names the app it belongs to: a clue, not proof.
-- **Changes outside the period it has records for.** A change made and undone while no watcher ran leaves no trace.
-  `/agent-ledger:check` says which period it has records for.
+- **Changes outside the time it can vouch for.** Each minute the watcher compares every file with its last record
+  and sends a heartbeat. `/agent-ledger:check` names the span those heartbeats cover, or says coverage is unknown and
+  since when. A change made and undone between two comparisons, if the event stream missed it, leaves no trace.
 - **Overlapping shell work.** Two agents running shell commands in one folder at the same time can cover each other's
   writes, because a shell write is attributed to the call whose time window it falls in.
 - **Fast or large writes.** Two writes within about 50 ms keep only the last version. Files over 64 MB are not tracked.
@@ -44,8 +45,9 @@ stale write wouldn't, so it stays an alert, labelled `git-index`.
 
 - **At session start,** a message lists the project's new alerts, one line each. It is shown to you, not to the model.
   If nothing has been recorded for the project on this machine, it says so.
-- **`/agent-ledger:check`** shows the project's alerts in full, with the diff and a restore command for each. With no
-  alerts, it says which period it has records for. With no records, it says it can't tell, never that all is clear.
+- **`/agent-ledger:check`** shows the project's alerts in full, with the diff and a restore command for each. It ends
+  with a state, never "clean": `ALERTS_PRESENT`; `NO_ALERTS_OBSERVED`, with the span the watcher's heartbeats cover; or
+  `COVERAGE_UNKNOWN`, with the reason. With no records at all, it says it can't tell.
 
 ## Recovery is guarded
 
@@ -61,8 +63,10 @@ lands between them is lost, and the restore itself shows up as an alert.
   file contents.
 - **A background watcher.** The first hook starts it, detached so it outlives the session, one per machine; its first
   start compiles `watch.swift` with `swiftc`. It watches each project where a session started (its git top level),
-  records every change's hash, size and provenance stamp, and keeps a copy of each version. It stops after 30 minutes
-  without agent activity. The next hook starts it again, and it then compares every file with its last version.
+  records every change's hash, size and provenance stamp, and keeps a copy of each version. Once a minute it compares
+  every file whose metadata changed with its last version, catching anything the event stream missed, and records a
+  heartbeat saying whether it could read the folder; a folder it can't read is reported, not swept. It stops after 30
+  minutes without agent activity. The next hook starts it again, and it then compares every file with its last version.
 - **Storage.** Everything is in `~/.agent-ledger`, readable only by you: the claims, the observations, and the kept
   copies of your files. Those include files git ignores, such as `.env`. Only `.git`, `.build`, `node_modules`,
   `__pycache__` and files over 64 MB are skipped. Nothing is pruned.

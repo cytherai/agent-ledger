@@ -10,7 +10,7 @@ python3 "${CLAUDE_PLUGIN_ROOT}/reconcile.py" --diff --project "${CLAUDE_PROJECT_
 
 If it exits with "nothing recorded", tell the user that Agent Ledger has no record of this project on this machine, so it can't say whether anything changed. Never present that as a clean result.
 
-With no alerts, say what the last line says: the ledger found none in the period it has records for. Don't say nothing else happened. If the user knows of changes after that period that the ledger doesn't show, say that its watcher may not be running here.
+Report the `State:` line as it is, and never call the project clean. `NO_ALERTS_OBSERVED` means no alert in the span the `Covered` line gives, not that nothing else happened. `COVERAGE_UNKNOWN` means the ledger can't say whether anything changed since the time it gives, for the reason it gives.
 
 When you discuss an alert, keep to what it states:
 - The writer is what its `writer:` line says, and no more. A provenance stamp names an app, never a session or command. A `seen by` or `undoes` call read or edited an earlier version, which says nothing about who wrote this one.
