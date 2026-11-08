@@ -1,0 +1,4 @@
+{
+  "name": "agent-ledger",
+  "hooks": "./hooks/codex.json"
+}
