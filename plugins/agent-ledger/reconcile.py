@@ -213,20 +213,21 @@ def evidence(o, by, previous):
 def coverage(observations, root, at):
     """How far the watcher vouches for `root` as of `at` (ms): (start, end, reason). Each heartbeat follows a sweep
     that compared every file with its last record, and says whether the folder could be read. The span ends at the
-    last heartbeat and starts after the last gap or unreadable beat before it. `reason` is None when the span reaches
-    `at` with the folder readable; otherwise it says why coverage is unknown since `end`."""
+    last readable heartbeat and starts after the last gap or unreadable beat before it. `reason` is None when the span
+    reaches `at`; otherwise it says why coverage is unknown since `end`."""
     beats = sorted((o for o in observations if o['kind'] == 'heartbeat' and o['t_ms'] <= at and under(root + '/', o['path'])),
                    key=lambda o: o['t_ms'])
-    if not beats:
-        return None, None, 'the watcher has recorded no heartbeat here'
-    if not beats[-1]['readable']:
-        return None, beats[-1]['t_ms'], 'the watcher could not read the folder'
-    start = beats[-1]
-    for b in reversed(beats[:-1]):
+    last = max((i for i, b in enumerate(beats) if b['readable']), default=None)
+    if last is None:
+        return None, None, 'the watcher could not read the folder' if beats else 'the watcher has recorded no heartbeat here'
+    start = beats[last]
+    for b in reversed(beats[:last]):
         if start['t_ms'] - b['t_ms'] > STALE_MS or not b['readable']:
             break
         start = b
-    return start['t_ms'], beats[-1]['t_ms'], 'no heartbeat since: the watcher is not running' if at - beats[-1]['t_ms'] > STALE_MS else None
+    why = ('the watcher could not read the folder after that' if last < len(beats) - 1 else
+           'no heartbeat after that: the watcher is not running' if at - beats[last]['t_ms'] > STALE_MS else None)
+    return start['t_ms'], beats[last]['t_ms'], why
 
 
 def reconcile(observations, claims, home=None):
