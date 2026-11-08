@@ -34,9 +34,9 @@ stale write wouldn't, so it stays an alert, labelled `git-index`.
 
 - **Who wrote a change no agent claimed.** The writer is "not established". If a macOS provenance stamp appeared with
   the change, the alert names the app it belongs to: a clue, not proof.
-- **Changes outside the time it can vouch for.** Each minute the watcher compares every file with its last record
-  and sends a heartbeat. `/agent-ledger:check` names the span those heartbeats cover, or says coverage is unknown and
-  since when. A change made and undone between two comparisons, if the event stream missed it, leaves no trace.
+- **Anything between its checks.** `/agent-ledger:check` asks the watcher to compare every file with its last record
+  at that moment. A clean comparison is a point-in-time result, not proof that monitoring had no gap: a change made
+  and undone between two comparisons, if the event stream missed it, leaves no trace.
 - **Overlapping shell work.** Two agents running shell commands in one folder at the same time can cover each other's
   writes, because a shell write is attributed to the call whose time window it falls in.
 - **Fast or large writes.** Two writes within about 50 ms keep only the last version. Files over 64 MB are not tracked.
@@ -48,8 +48,10 @@ stale write wouldn't, so it stays an alert, labelled `git-index`.
 - **At session start,** a message lists the project's new alerts, one line each. It is shown to you, not to the model.
   If nothing has been recorded for the project on this machine, it says so.
 - **`/agent-ledger:check`** shows the project's alerts in full, with the diff and a restore command for each. It ends
-  with a state, never "clean": `ALERTS_PRESENT`; `NO_ALERTS_OBSERVED`, with the span the watcher's heartbeats cover; or
-  `COVERAGE_UNKNOWN`, with the reason. With no records at all, it says it can't tell.
+  with a state, never "clean": `ALERTS_PRESENT`; `NO_ALERTS_OBSERVED`, when the watcher has just compared every file
+  with its last record, found them all matching and unchanged while it compared them, and no recorded change raised an
+  alert; or `COVERAGE_UNKNOWN`, with the reason: no watcher answered within 15 s, it could not read the folder or some
+  of its files, or files kept changing. With no records at all, it says it can't tell.
 
 ## Recovery is guarded
 
@@ -67,7 +69,8 @@ lands between them is lost, and the restore itself shows up as an alert.
   start compiles `watch.swift` with `swiftc`. It watches each project where a session started (its git top level),
   records every change's hash, size and provenance stamp, and keeps a copy of each version. Once a minute it compares
   every file whose metadata changed with its last version, catching anything the event stream missed, and records a
-  heartbeat saying whether it could read the folder; a folder it can't read is reported, not swept. It stops after 30
+  heartbeat saying whether it could read the folder; a folder it can't read is reported, not swept. It does the same
+  comparison when `/agent-ledger:check` asks, through a request file in `~/.agent-ledger/requests`. It stops after 30
   minutes without agent activity. The next hook starts it again, and it then compares every file with its last version.
 - **Storage.** Everything is in `~/.agent-ledger`, readable only by you: the claims, the observations, and the kept
   copies of your files. Those include files git ignores, such as `.env`. Only `.git`, `.build`, `node_modules`,

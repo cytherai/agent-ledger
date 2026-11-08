@@ -32,7 +32,7 @@ of the version before it, which refuses if the file changed after the alert. Wit
 incident report for each alert from its first line, content and restore lines and diff; it is never told the writer,
 who saw the version, or the change undone. That sends file contents to Anthropic's API (ANTHROPIC_API_KEY), after
 keys, tokens and passwords are redacted on this machine.
-Usage: reconcile.py [--home DIR] [--project DIR] [--at MS] [--diff] [--explain]
+Usage: reconcile.py [--home DIR] [--project DIR] [--checkpoint | --answered ID] [--diff] [--explain]
        reconcile.py [--home DIR] --restore PATH EXPECTED VERSION
 """
 import argparse
@@ -48,6 +48,7 @@ import subprocess
 import sys
 import time
 import unicodedata
+import uuid
 import urllib.error
 import urllib.request
 from datetime import datetime
@@ -55,7 +56,10 @@ from pathlib import Path
 
 GRACE_MS = 2000
 VCS_WINDOW_MS = 2000
-STALE_MS = 150_000  # the watcher sends a heartbeat every 60 s; none for this long means it isn't running
+STALE_MS = 150_000  # the watcher sends a heartbeat every 60 s; none for this long is a gap
+CHECK_WAIT_S = 15  # how long a check waits for the watcher's answer; none by then is coverage unknown
+UNSETTLED = {'unwatched': 'the watcher is not watching this project', 'unreadable': 'the watcher could not read the project',
+             'unreadable-files': 'the watcher could not read some of its files', 'unsettled': 'files kept changing during the check'}
 GIT_WRITES = re.compile(r'\bgit\s+(?:-C\s+\S+\s+)?(?:checkout|restore|reset|stash|switch|rebase|merge|pull|cherry-pick|revert|am|apply)\b')
 READ_ONLY = {'Read', 'Glob', 'Grep', 'LS', 'WebFetch', 'WebSearch'}  # Claude Code tools that cannot write a file
 MARKERS = {'ChatGPT app (Codex)': '~/.codex/logs_2.sqlite'}  # a file only that app writes: its stamp names the app
@@ -210,24 +214,36 @@ def evidence(o, by, previous):
     return basis or ['none']
 
 
-def coverage(observations, root, at):
-    """How far the watcher vouches for `root` as of `at` (ms): (start, end, reason). Each heartbeat follows a sweep
-    that compared every file with its last record, and says whether the folder could be read. The span ends at the
-    last readable heartbeat and starts after the last gap or unreadable beat before it. `reason` is None when the span
-    reaches `at`; otherwise it says why coverage is unknown since `end`."""
-    beats = sorted((o for o in observations if o['kind'] == 'heartbeat' and o['t_ms'] <= at and under(root + '/', o['path'])),
-                   key=lambda o: o['t_ms'])
+def swept(observations, root):
+    """The latest span of the watcher's minutely sweeps of `root`, readable and unbroken: (start, end), or None. History
+    only: a check decides coverage from its own checkpoint, never from past heartbeats."""
+    beats = sorted((o for o in observations if o['kind'] == 'heartbeat' and under(root + '/', o['path'])), key=lambda o: o['t_ms'])
     last = max((i for i, b in enumerate(beats) if b['readable']), default=None)
     if last is None:
-        return None, None, 'the watcher could not read the folder' if beats else 'the watcher has recorded no heartbeat here'
+        return None
     start = beats[last]
     for b in reversed(beats[:last]):
         if start['t_ms'] - b['t_ms'] > STALE_MS or not b['readable']:
             break
         start = b
-    why = ('the watcher could not read the folder after that' if last < len(beats) - 1 else
-           'no heartbeat after that: the watcher is not running' if at - beats[last]['t_ms'] > STALE_MS else None)
-    return start['t_ms'], beats[last]['t_ms'], why
+    return start['t_ms'], beats[last]['t_ms']
+
+
+def request_checkpoint(home, project, wait=CHECK_WAIT_S):
+    """Asks the running watcher to compare `project` with its records now. Returns the `sweep` record it writes once
+    that is complete, or None when none came within `wait` seconds; the request is then withdrawn."""
+    rid, folder = uuid.uuid4().hex, Path(home, 'requests')
+    folder.mkdir(mode=0o700, exist_ok=True)
+    (folder / f'.{rid}').write_text(json.dumps({'id': rid, 'path': project}))
+    (folder / f'.{rid}').rename(folder / f'{rid}.json')  # whole or absent: the watcher reads only *.json
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        answer = next((o for o in load(Path(home, 'observations.jsonl')) if o['kind'] == 'sweep' and o.get('request') == rid), None)
+        if answer:
+            return answer
+        time.sleep(0.2)
+    (folder / f'{rid}.json').unlink(missing_ok=True)
+    return None
 
 
 def reconcile(observations, claims, home=None):
@@ -395,7 +411,10 @@ def main():
     p.add_argument('--restore', nargs=3, metavar=('PATH', 'EXPECTED', 'VERSION'),
                    help=f'put the kept VERSION back at PATH, only if PATH still has the hash EXPECTED ({ABSENT} if deleted)')
     p.add_argument('--project', default='/', help='only alerts under this folder; exits 1 if nothing was ever recorded under it')
-    p.add_argument('--at', type=int, help='judge coverage as of this time, in ms since the epoch (default: now)')
+    check = p.add_mutually_exclusive_group()
+    check.add_argument('--checkpoint', action='store_true',
+                       help='ask the running watcher to compare the project with its records now; without a settled answer, coverage is unknown')
+    check.add_argument('--answered', metavar='ID', help="judge coverage by the recorded answer to the project's check request ID, without asking")
     a = p.parse_args()
     home = Path(a.home)
     if a.restore:
@@ -406,20 +425,30 @@ def main():
         raise SystemExit(f'nothing recorded under {project} on this machine, so no alert there means nothing. The watcher '
                          "runs only on macOS, needs swiftc for its first start, and needs the app's access to the folder; "
                          f'see {home / "watch.log"}.')
+    if a.checkpoint:
+        answer, observations = request_checkpoint(home, project), load(home / 'observations.jsonl')  # with what the check found
+    else:  # an answer for this project only
+        answer = next((o for o in observations if o['kind'] == 'sweep' and o.get('request') == a.answered and o['path'] == project), None)
     found = [x for x in reconcile(observations, load(home / 'claims.jsonl'), home) if under(x['o']['path'], project)]
     alerts = [x for x in found if x['kinds'] != ['GIT']]
     if a.explain and alerts:
         print(f"--explain: sending {len(alerts)} alert(s) to Anthropic's API; keys, tokens and passwords are redacted first", file=sys.stderr)
     report(alerts, labels, home, a.diff, a.explain)
     print(f'{len(alerts)} alert(s); {len(found) - len(alerts)} change(s) made by git')
-    start, end, why = coverage(observations, project, round(time.time() * 1000) if a.at is None else a.at)
+    why = ('no check was asked for (run with --checkpoint)' if not (a.checkpoint or a.answered) else
+           'no watcher answered the check' if answer is None else
+           None if answer['status'] == 'settled' else UNSETTLED.get(answer['status'], f"the watcher answered {answer['status']}"))
     print(f"State: {'ALERTS_PRESENT' if alerts else 'COVERAGE_UNKNOWN' if why else 'NO_ALERTS_OBSERVED'} under {project}.")
-    if start is not None:
-        print(f'Covered from {clock(start)} to {clock(end)}: each minute the watcher could read the folder and compared '
-              'every file with its last record. A change made and undone between two comparisons, if the event stream '
-              'missed it, is not in this ledger.')
     if why:
-        print(f"Coverage unknown{f' since {clock(end)}' if end else ''}: {why}.")
+        print(f'Coverage unknown: {why}.')
+    else:
+        print(f"Checkpoint {answer['sequence']}, completed {clock(answer['t_ms'])}: every tracked file under {project} matched "
+              'its last record, and none changed while it was compared.')
+    span = swept(observations, project)
+    if span:
+        print(f"The watcher's minutely sweeps of the folder ran unbroken from {clock(span[0])} to {clock(span[1])}.")
+    print('None of this shows that monitoring had no gap, or that no change was made and undone between two sweeps '
+          'without the event stream seeing it.')
 
 
 if __name__ == '__main__':

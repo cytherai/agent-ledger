@@ -9,7 +9,9 @@
 // Once a minute, and after the startup comparison, it sweeps each project: it compares every file whose ctime moved
 // since it was last hashed with its last recorded version, and records what the event stream missed ("checkpoint").
 // Then it records a "heartbeat" for the project saying whether the folder could be read. An unreadable folder is
-// not swept, so a folder the watcher cannot see never looks like files were deleted.
+// not swept, so a folder the watcher cannot see never looks like files were deleted. A sweep leaves a change younger
+// than the event stream's delay to the stream. A check asks for a sweep of one project through HOME/requests and gets
+// a "sweep" record once it is complete (see answer()).
 // Files over 64 MB, and anything under .build, node_modules or __pycache__, are not tracked. HOME is owner-only (0700).
 // One watcher per HOME: it holds an exclusive lock on HOME/watch.lock, and a second one exits at once. It watches the
 // projects listed in HOME/roots (ROOT arguments are added there), and a project appended later joins without a gap:
@@ -47,9 +49,11 @@ try FileManager.default.createDirectory(at: versions, withIntermediateDirectorie
 if !FileManager.default.fileExists(atPath: log.path) { FileManager.default.createFile(atPath: log.path, contents: nil) }
 var last: [String: String] = [:]  // path -> sha256 of its last recorded version ("" when deleted)
 var hashedAt: [String: timespec] = [:]  // path -> its ctime when last hashed
+var unreadable = Set<String>()  // tracked files that exist but could not be read
+let grace: TimeInterval = 2  // longer than the event stream takes to report a change (0.6 s at most, measured under load)
 for line in (try String(contentsOf: log, encoding: .utf8)).split(separator: "\n") {
     let o = try JSONSerialization.jsonObject(with: Data(line.utf8)) as! [String: Any]
-    if !["vcs", "gap", "heartbeat"].contains(o["kind"] as! String) { last[o["path"] as! String] = o["sha256"] as? String ?? "" }
+    if !["vcs", "gap", "heartbeat", "sweep"].contains(o["kind"] as! String) { last[o["path"] as! String] = o["sha256"] as? String ?? "" }
 }
 let out = try FileHandle(forWritingTo: log)
 out.seekToEndOfFile()
@@ -95,14 +99,19 @@ func record(_ path: String, kind: String, flags: [String] = []) {
     var st = stat()
     if lstat(path, &st) == 0 {
         if st.st_mode & S_IFMT != S_IFREG || st.st_size > maxBytes { return }  // not a tracked file
-        // a sweep hashes only what changed since it was last hashed: every write moves ctime, and nothing sets it back
-        if kind == "checkpoint", let t = hashedAt[path], t.tv_sec == st.st_ctimespec.tv_sec, t.tv_nsec == st.st_ctimespec.tv_nsec { return }
+        if kind == "checkpoint" {  // a sweep records only what the event stream missed
+            // it hashes only what changed since it was last hashed: every write moves ctime, and nothing sets it back
+            if let t = hashedAt[path], t.tv_sec == st.st_ctimespec.tv_sec, t.tv_nsec == st.st_ctimespec.tv_nsec { return }
+            // and leaves a change too recent for the stream to have reported yet, or an agent's write reads as unseen
+            if Date().timeIntervalSince1970 - (Double(st.st_ctimespec.tv_sec) + Double(st.st_ctimespec.tv_nsec) / 1e9) < grace { return }
+        }
         hashedAt[path] = st.st_ctimespec
     } else if errno != ENOENT {
         return  // it can't be looked at, which is not evidence that it is gone
     }
     let s = snapshot(path)
-    if s == nil, lstat(path, &st) == 0 { return }  // there but unreadable: neither a deletion nor a change
+    if s == nil, lstat(path, &st) == 0 { unreadable.insert(path); return }  // there but unreadable: neither a deletion nor a change
+    unreadable.remove(path)
     let sha = s?.sha ?? ""  // "" once it no longer exists
     guard sha != (last[path] ?? "") else { return }  // unchanged since the last record
     last[path] = sha
@@ -123,16 +132,39 @@ func scan(_ root: String, kind: String) {
     }
 }
 
+/// Compares every tracked file under `dir` with its last record, deletions included. A sweep leaves a deletion whose
+/// folder changed within `grace` to the event stream, as it does a recent change; `stable` then says it is pending.
+func compare(_ dir: String, kind: String) {
+    scan(dir, kind: kind)
+    for (path, sha) in last where !sha.isEmpty && path.hasPrefix(dir + "/") && !FileManager.default.fileExists(atPath: path) {
+        var st = stat()
+        if kind == "checkpoint", lstat((path as NSString).deletingLastPathComponent, &st) == 0,
+           Date().timeIntervalSince1970 - Double(st.st_mtimespec.tv_sec) < grace { continue }
+        record(path, kind: kind)  // deleted unseen
+    }
+}
+
+/// Whether every tracked file under `dir` still has the ctime it had when last hashed, with none added or gone: then
+/// nothing changed after the sweep read it.
+func stable(_ dir: String) -> Bool {
+    guard let walker = FileManager.default.enumerator(atPath: dir) else { return false }
+    var present = Set<String>()
+    while let relative = walker.nextObject() as? String {
+        if skipped.contains((relative as NSString).lastPathComponent) { walker.skipDescendants(); continue }
+        let path = dir + "/" + relative
+        var st = stat()
+        guard !path.hasPrefix(home.path + "/"), lstat(path, &st) == 0, st.st_mode & S_IFMT == S_IFREG, st.st_size <= maxBytes else { continue }
+        guard let t = hashedAt[path], t.tv_sec == st.st_ctimespec.tv_sec, t.tv_nsec == st.st_ctimespec.tv_nsec else { return false }
+        present.insert(path)
+    }
+    return !last.contains { path, sha in !sha.isEmpty && path.hasPrefix(dir + "/") && !path.contains("/.git/") && !present.contains(path) }
+}
+
 /// Compares each readable project with its last records, deletions included, then records a heartbeat per project.
 func sweep(kind: String) {
     for root in roots {
         let readable = (try? FileManager.default.contentsOfDirectory(atPath: root)) != nil
-        if readable {
-            scan(root, kind: kind)
-            for (path, sha) in last where !sha.isEmpty && path.hasPrefix(root + "/") && !FileManager.default.fileExists(atPath: path) {
-                record(path, kind: kind)  // deleted unseen
-            }
-        }
+        if readable { compare(root, kind: kind) }
         write(["kind": "heartbeat", "path": root, "readable": readable])
     }
 }
@@ -189,5 +221,52 @@ idle.setEventHandler {
     let lastClaim = (try? FileManager.default.attributesOfItem(atPath: claims))?[.modificationDate] as? Date ?? began
     if Date().timeIntervalSince(max(lastClaim, began)) > idleSeconds { exit(0) }
 }
+
+let requests = home.appendingPathComponent("requests")
+try FileManager.default.createDirectory(at: requests, withIntermediateDirectories: true, attributes: ownerOnly)
+var answered = 0  // the checkpoint sequence
+/// Runs `work` once on the watcher's queue after `delay`, through a dispatch source like every other handler here.
+func later(_ delay: TimeInterval, _ work: @escaping () -> Void) {
+    let timer = DispatchSource.makeTimerSource(queue: queue)
+    timer.schedule(deadline: .now() + delay)
+    timer.setEventHandler { timer.cancel(); work() }
+    timer.resume()
+}
+/// Answers each pending request, HOME/requests/<id>.json holding {"id", "path"}, with a "sweep" record written only
+/// once its sweep is complete. "settled": every tracked file under the path matched its last record, and none changed
+/// while it was compared. Otherwise "unwatched" (not a canonical path inside a watched project), "unreadable",
+/// "unreadable-files", or "unsettled" (changes still pending after three tries).
+func answer() {
+    for name in ((try? FileManager.default.contentsOfDirectory(atPath: requests.path)) ?? []) where name.hasSuffix(".json") {
+        let file = requests.appendingPathComponent(name)
+        let request = (try? Data(contentsOf: file)).flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+        try? FileManager.default.removeItem(at: file)
+        guard let id = request?["id"] as? String, let path = request?["path"] as? String else { continue }
+        answered += 1
+        check(id, path, sequence: answered, attempt: 1)
+    }
+}
+func check(_ id: String, _ path: String, sequence: Int, attempt: Int) {
+    let canonical = realpath(path, nil).map { p -> String in defer { free(p) }; return String(cString: p) }
+    var status = "settled"
+    if canonical != path || !roots.contains(where: { path == $0 || path.hasPrefix($0 + "/") }) {
+        status = "unwatched"
+    } else if (try? FileManager.default.contentsOfDirectory(atPath: path)) == nil {
+        status = "unreadable"
+    } else {
+        compare(path, kind: "checkpoint")
+        if !stable(path) {  // a change it left to the stream, or one during the sweep: sweep again once the stream has caught up
+            if attempt < 3 { return later(grace) { check(id, path, sequence: sequence, attempt: attempt + 1) } }
+            status = "unsettled"
+        } else if unreadable.contains(where: { $0.hasPrefix(path + "/") }) {
+            status = "unreadable-files"
+        }
+    }
+    write(["kind": "sweep", "path": path, "request": id, "sequence": sequence, "status": status])
+}
+let requested = DispatchSource.makeFileSystemObjectSource(fileDescriptor: open(requests.path, O_EVTONLY), eventMask: .write, queue: queue)
+requested.setEventHandler(handler: answer)
+requested.resume()
+later(0, answer)  // requests made before this watcher started
 idle.resume()
 dispatchMain()
