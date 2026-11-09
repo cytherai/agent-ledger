@@ -102,7 +102,9 @@ def load(path, damaged=None):
 
 
 def calls(claims):
-    """One entry per tool call, its PreToolUse and PostToolUse claims merged into a time window. A call ID counts only
+    """One entry per tool call, its PreToolUse and PostToolUse (or PostToolUseFailure) claims merged into a time window.
+    A call with no claim after its PreToolUse (refused, interrupted, or from a hook before 0.1.5 that missed failures)
+    ends where it began, so its window is 2 s from its start. A call ID counts only
     within its agent and session, and a session's start is no tool call."""
     merged = {}
     for c in sorted((c for c in claims if c['event'] != 'SessionStart'), key=lambda c: c['t_ms']):

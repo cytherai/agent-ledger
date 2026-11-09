@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Agent hook: appends what an agent says it is doing to the claims ledger.
 
-Install as a PreToolUse and PostToolUse command hook in Claude Code (`hook.py claude`) and in Codex
-(`hook.py codex`); both send the same JSON on stdin, and Codex adds turn_id. A PostToolUse claim records the SHA-256
-of each file the tool named, as the tool left it, so the reconciler can match an observed write to the call that made
-it. File contents are never stored. An error exits 1, which both agents report without blocking the tool.
+Install as a PreToolUse and PostToolUse command hook in Claude Code (`hook.py claude`, where PostToolUseFailure, for a
+call that fails, runs it too) and in Codex (`hook.py codex`); both send the same JSON on stdin, and Codex adds turn_id.
+A PostToolUse or PostToolUseFailure claim records the SHA-256 of each file the tool named, as the tool left it, so the
+reconciler can match an observed write to the call that made it. File contents are never stored. An error exits 1, which both agents report without blocking the tool.
 
 The hook never steers the agent: it prints only at SessionStart, and only a systemMessage, which both agents show to
 the user and not to the model. It names the project's alerts that are new since the last one it showed, one line each.
@@ -48,7 +48,7 @@ def claim(agent, event, now_ms):
     record = {'schema': 1, 't_ms': now_ms, 'agent': agent, 'event': event.get('hook_event_name'), 'session': event.get('session_id'),
               'turn': event.get('turn_id'), 'tool': event.get('tool_name'), 'tool_use_id': event.get('tool_use_id'),
               'cwd': cwd, 'command': command or tool_input.get('code'), 'paths': sorted({canonical(os.path.join(cwd, p)) for p in named})}
-    if record['event'] == 'PostToolUse':
+    if record['event'] in ('PostToolUse', 'PostToolUseFailure'):  # a failed call ends too, and leaves its files as they are
         record['sha256'] = {p: sha256(p) for p in record['paths']}
     return record
 
