@@ -51,12 +51,15 @@ var last: [String: String] = [:]  // path -> sha256 of its last recorded version
 var hashedAt: [String: timespec] = [:]  // path -> its ctime when last hashed
 var unreadable = Set<String>()  // tracked files that exist but could not be read
 let grace: TimeInterval = 2  // longer than the event stream takes to report a change (0.6 s at most, measured under load)
-for line in (try String(contentsOf: log, encoding: .utf8)).split(separator: "\n") {
-    let o = try JSONSerialization.jsonObject(with: Data(line.utf8)) as! [String: Any]
-    if !["vcs", "gap", "heartbeat", "sweep"].contains(o["kind"] as! String) { last[o["path"] as! String] = o["sha256"] as? String ?? "" }
+let logged = try Data(contentsOf: log)
+for line in String(decoding: logged, as: UTF8.self).split(separator: "\n") {
+    guard let o = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any], let kind = o["kind"] as? String,
+          let path = o["path"] as? String else { continue }  // a line cut short, or damaged: not a record (reconcile.py reports it)
+    if !["vcs", "gap", "heartbeat", "sweep"].contains(kind) { last[path] = o["sha256"] as? String ?? "" }
 }
 let out = try FileHandle(forWritingTo: log)
 out.seekToEndOfFile()
+if let end = logged.last, end != UInt8(ascii: "\n") { out.write(Data("\n".utf8)) }  // end a line cut short, so the next record stands alone
 
 func write(_ o: [String: Any]) {
     let stamped = o.merging(["schema": 1, "t_ms": Int(Date().timeIntervalSince1970 * 1000)]) { current, _ in current }
@@ -128,13 +131,20 @@ func scan(_ root: String, kind: String) {
         let name = (relative as NSString).lastPathComponent
         if name == ".git" { reflogs.forEach { record(root + "/" + relative + "/" + $0, kind: kind) } }
         if skipped.contains(name) { walker.skipDescendants(); continue }
-        record(root + "/" + relative, kind: kind)
+        let path = root + "/" + relative
+        var st = stat()
+        if lstat(path, &st) == 0, st.st_mode & S_IFMT == S_IFDIR {  // the walker passes over a folder it can't open in silence
+            if access(path, R_OK | X_OK) == 0 { unreadable.remove(path) } else { unreadable.insert(path) }
+            continue
+        }
+        record(path, kind: kind)
     }
 }
 
 /// Compares every tracked file under `dir` with its last record, deletions included. A sweep leaves a deletion whose
 /// folder changed within `grace` to the event stream, as it does a recent change; `stable` then says it is pending.
 func compare(_ dir: String, kind: String) {
+    unreadable = unreadable.filter { path in var st = stat(); return !path.hasPrefix(dir + "/") || lstat(path, &st) == 0 || errno != ENOENT }  // gone
     scan(dir, kind: kind)
     for (path, sha) in last where !sha.isEmpty && path.hasPrefix(dir + "/") && !FileManager.default.fileExists(atPath: path) {
         var st = stat()
@@ -182,7 +192,7 @@ let callback: FSEventStreamCallback = { _, _, count, paths, flags, _ in
         let named = names.filter { flags[i] & UInt32($0.0) != 0 }.map(\.1)
         if flags[i] & UInt32(kFSEventStreamEventFlagMustScanSubDirs) != 0 {  // events were dropped under this path
             write(["kind": "gap", "path": path, "flags": named])
-            scan(path, kind: "rescan")
+            compare(path, kind: "rescan")  // what changed there, deletions included
         } else if flags[i] & UInt32(kFSEventStreamEventFlagItemIsFile) != 0 {
             record(path, kind: "change", flags: named)
         }
@@ -190,10 +200,11 @@ let callback: FSEventStreamCallback = { _, _, count, paths, flags, _ in
 }
 let queue = DispatchQueue(label: "agent-ledger.watch")  // every record is written from here, or from main before it starts
 func start(since: FSEventStreamEventId) -> FSEventStreamRef {
-    let s = FSEventStreamCreate(nil, callback, nil, roots as CFArray, since, 0.05,
-        UInt32(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagUseExtendedData | kFSEventStreamCreateFlagNoDefer))!
+    guard let s = FSEventStreamCreate(nil, callback, nil, roots as CFArray, since, 0.05,
+        UInt32(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagUseExtendedData | kFSEventStreamCreateFlagNoDefer))
+    else { print("no event stream: FSEventStreamCreate failed"); exit(1) }
     FSEventStreamSetDispatchQueue(s, queue)
-    FSEventStreamStart(s)
+    guard FSEventStreamStart(s) else { print("no event stream: FSEventStreamStart failed"); exit(1) }  // without it, no check is answered
     print("watching", roots.joined(separator: " "))
     fflush(stdout)
     return s
@@ -255,11 +266,11 @@ func check(_ id: String, _ path: String, sequence: Int, attempt: Int) {
         status = "unreadable"
     } else {
         compare(path, kind: "checkpoint")
-        if !stable(path) {  // a change it left to the stream, or one during the sweep: sweep again once the stream has caught up
+        if unreadable.contains(where: { $0.hasPrefix(path + "/") }) {  // files or folders it could not read: not compared
+            status = "unreadable-files"
+        } else if !stable(path) {  // a change it left to the stream, or one during the sweep: sweep again once the stream has caught up
             if attempt < 3 { return later(grace) { check(id, path, sequence: sequence, attempt: attempt + 1) } }
             status = "unsettled"
-        } else if unreadable.contains(where: { $0.hasPrefix(path + "/") }) {
-            status = "unreadable-files"
         }
     }
     write(["kind": "sweep", "path": path, "request": id, "sequence": sequence, "status": status])

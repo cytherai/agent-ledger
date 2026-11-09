@@ -36,13 +36,16 @@ Usage: reconcile.py [--home DIR] [--project DIR] [--checkpoint | --answered ID] 
        reconcile.py [--home DIR] --restore PATH EXPECTED VERSION
 """
 import argparse
+import collections
 import ctypes
 import difflib
 import functools
 import hashlib
+import itertools
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -60,11 +63,12 @@ STALE_MS = 150_000  # the watcher sends a heartbeat every 60 s; none for this lo
 CHECK_WAIT_S = 15  # how long a check waits for the watcher's answer; none by then is coverage unknown
 UNSETTLED = {'unwatched': 'the watcher is not watching this project', 'unreadable': 'the watcher could not read the project',
              'unreadable-files': 'the watcher could not read some of its files', 'unsettled': 'files kept changing during the check'}
-GIT_WRITES = re.compile(r'\bgit\s+(?:-C\s+\S+\s+)?(?:checkout|restore|reset|stash|switch|rebase|merge|pull|cherry-pick|revert|am|apply)\b')
+SHELL_OPERATORS = {'&&', '||', ';', '|', '&', '(', ')', '<', '>', '>>'}  # where one command's arguments end
 READ_ONLY = {'Read', 'Glob', 'Grep', 'LS', 'WebFetch', 'WebSearch'}  # Claude Code tools that cannot write a file
 MARKERS = {'ChatGPT app (Codex)': '~/.codex/logs_2.sqlite'}  # a file only that app writes: its stamp names the app
 MODEL = 'claude-opus-5-5'
 ABSENT = 'absent'  # the state of a deleted file, where a restore expects a hash
+EMPTY = hashlib.sha256(b'').hexdigest()
 SECRETS = [  # (pattern, replacement): private keys, known token formats, then values assigned to secret-looking names
     (re.compile(r'-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----', re.S), '[REDACTED PRIVATE KEY]'),
     (re.compile(r'\b(?:sk-ant-[\w-]{20,}|sk-[\w-]{20,}|A[KS]IA[0-9A-Z]{16}|gh[pousr]_\w{30,}|github_pat_\w{40,}|xox[abprs]-[\w-]{10,}'
@@ -79,16 +83,30 @@ BRIEF = ('You write incident reports for an agent write ledger. From the facts a
          'what it only suggests. Copy paths, hashes and commands exactly, never shortened.')
 
 
-def load(path):
+def load(path, damaged=None):
+    """The records in a ledger file, one JSON object per line. A line that is not a record is left out, and its number
+    added to `damaged` when that is given; a last line without its newline is a write still in progress, so it is left
+    out without being counted."""
     path = Path(path)
-    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()] if path.exists() else []
+    if not path.exists():
+        return []
+    records, lines = [], path.read_bytes().decode(errors='replace').split('\n')
+    for n, line in enumerate(lines, 1):
+        if line.strip():
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:  # cut short, or damaged: not a record
+                if damaged is not None and n < len(lines):
+                    damaged.append(n)
+    return records
 
 
 def calls(claims):
-    """One entry per tool call, its PreToolUse and PostToolUse claims merged into a time window."""
+    """One entry per tool call, its PreToolUse and PostToolUse claims merged into a time window. A call ID counts only
+    within its agent and session, and a session's start is no tool call."""
     merged = {}
-    for c in sorted(claims, key=lambda c: c['t_ms']):
-        call = merged.setdefault(c['tool_use_id'], {**c, 'start': c['t_ms'], 'sha256': {}, 'paths': []})
+    for c in sorted((c for c in claims if c['event'] != 'SessionStart'), key=lambda c: c['t_ms']):
+        call = merged.setdefault((c['agent'], c['session'], c['tool_use_id']), {**c, 'start': c['t_ms'], 'sha256': {}, 'paths': []})
         call['end'] = c['t_ms']
         call['sha256'].update(c.get('sha256') or {})
         call['paths'] = sorted(set(call['paths']) | set(c['paths']))
@@ -122,14 +140,25 @@ def names(call, path):
 def covers(call, o):
     if call['tool'] in READ_ONLY or not call['start'] <= o['t_ms'] <= call['end'] + GRACE_MS:
         return False
-    return names(call, o['path']) or (bool(call.get('command')) and key(o['path']).startswith(key(call['cwd']).rstrip('/') + '/'))
+    shell = bool(call.get('command')) and call['tool'] != 'apply_patch'  # hooks before 0.1.4 kept a patch as its command
+    return names(call, o['path']) or (shell and key(o['path']).startswith(key(call['cwd']).rstrip('/') + '/'))
+
+
+def left(call, o, upcoming):
+    """Whether `o` can be the call's work: the call recorded no result for this file, or left exactly this version, or
+    left a version still to come within its window, so `o` was on the way to it. A different last version is not its."""
+    results = {key(p): h for p, h in call['sha256'].items()}
+    if key(o['path']) not in results:
+        return True
+    end = call['end'] + GRACE_MS
+    return any(v.get('sha256') == results[key(o['path'])] for v in itertools.takewhile(lambda v: v['t_ms'] <= end, itertools.chain([o], upcoming)))
 
 
 @functools.cache
 def repository(directory):
-    """The root of the git working tree holding `directory`, or None."""
+    """The root of the git working tree holding `directory`, or None. A linked worktree's `.git` is a file."""
     while directory != os.path.dirname(directory):
-        if os.path.isdir(os.path.join(directory, '.git')):
+        if os.path.exists(os.path.join(directory, '.git')):
             return directory
         directory = os.path.dirname(directory)
     return None
@@ -172,27 +201,61 @@ def blob(root, version_file):
     return git(root, 'hash-object', '--', str(version_file)).stdout.decode().strip()
 
 
-def git_operation(o, covering, moves, home):
-    """Whether git made this change: an agent's shell call that ran a worktree-writing git command covers it, or a reflog
-    move within the window promises exactly this content (or this deletion)."""
-    if any(GIT_WRITES.search(c.get('command') or '') for c in covering):
-        return True
+def stored(root, o, home):
+    """Whether git holds this version's content, in a commit or the index."""
+    return bool(o.get('sha256')) and git(root, 'cat-file', '-e', blob(root, home / 'versions' / o['sha256'])).returncode == 0
+
+
+def restores(call, path):
+    """Whether the call's shell command runs `git checkout` or `git restore` naming `path` or a folder holding it: the
+    git commands that put files back without moving a reflog. Quoted text is not a command."""
+    lexer = shlex.shlex(call.get('command') or '', posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True  # a file name is one word, operators apart
+    try:
+        words = list(lexer)
+    except ValueError:  # unbalanced quotes: not a command this can read
+        return False
+    for i, word in enumerate(words):
+        base, rest = call['cwd'], words[i + 1:]
+        if os.path.basename(word) != 'git':
+            continue
+        while rest[:1] in (['-C'], ['-c']) and len(rest) > 1:  # git's own options, before its command
+            base, rest = os.path.join(base, rest[1]) if rest[0] == '-C' else base, rest[2:]
+        if rest[:1] in (['checkout'], ['restore']):
+            for arg in itertools.takewhile(lambda w: w not in SHELL_OPERATORS, rest[1:]):
+                target = os.path.normpath(os.path.join(base, arg))
+                if not arg.startswith('-') and (key(path) == key(target) or under(path, target)):
+                    return True
+    return False
+
+
+def git_operation(o, covering, moves, home, upcoming=()):
+    """Whether git made this change: it holds content git stores, and an agent's shell call covering it ran `git
+    checkout` or `git restore` on it; or a reflog move within the window promises exactly this content (or this
+    deletion). Git replaces a file by removing or emptying it and writing it again, so a removed or empty version
+    counts too when the file holds what the move promises within the window. Command text alone never does: a
+    read-only, quoted or unrelated git command leaves the alert."""
     root = repository(os.path.dirname(o['path']))
+    if root is None or home is None:
+        return False
+    if any(restores(c, o['path']) for c in covering) and stored(root, o, home):
+        return True
     nearby = [rev for t, r, rev in moves if r == root and abs(t - o['t_ms']) <= VCS_WINDOW_MS]
     if not nearby:
         return False
-    actual = blob(root, home / 'versions' / o['sha256']) if o.get('sha256') else None
     relative = os.path.relpath(o['path'], root)
-    return any((git(root, 'rev-parse', '--verify', '--quiet', f'{rev}:{relative}').stdout.decode().strip() or None) == actual for rev in nearby)
+    promised = {git(root, 'rev-parse', '--verify', '--quiet', f'{rev}:{relative}').stdout.decode().strip() or None for rev in nearby}
+    on_the_way = itertools.takewhile(lambda v: v['t_ms'] <= o['t_ms'] + VCS_WINDOW_MS, upcoming) if o.get('sha256') in (None, EMPTY) else ()
+    return any((blob(root, home / 'versions' / v['sha256']) if v.get('sha256') else None) in promised for v in itertools.chain([o], on_the_way))
 
 
 def index_refresh(o, markers, home):
     """The index changed within the window and git stores the new content: a `git restore`, or a stale write of a
     committed version beside a `git status`. The two cannot be told apart on disk."""
     root = repository(os.path.dirname(o['path']))
-    if root is None or not o.get('sha256') or not any(m['root'] == root and abs(m['t_ms'] - o['t_ms']) <= VCS_WINDOW_MS for m in markers):
+    if root is None or not any(m['root'] == root and abs(m['t_ms'] - o['t_ms']) <= VCS_WINDOW_MS for m in markers):
         return False
-    return git(root, 'cat-file', '-e', blob(root, home / 'versions' / o['sha256'])).returncode == 0
+    return stored(root, o, home)
 
 
 def mentions(call, path):
@@ -254,29 +317,41 @@ def reconcile(observations, claims, home=None):
     moves = reflog_moves(observations, home) if home else []
     files = [o for o in observations if o['kind'] in ('startup', 'change', 'rescan', 'checkpoint')]
     skip = ignored({o['path'] for o in files})
-    tool_calls, history, alerts = calls(claims), {}, []
-    for o in sorted((o for o in files if o['path'] not in skip), key=lambda o: o['t_ms']):
-        before = history.setdefault(o['path'], [])
-        covering = [c for c in tool_calls if covers(c, o)]
+    enrolled = {}  # project -> its first heartbeat, which ends its first sweep: a file first seen after it is news
+    for o in observations:
+        if o['kind'] == 'heartbeat':
+            enrolled[o['path']] = min(o['t_ms'], enrolled.get(o['path'], o['t_ms']))
+    ordered = sorted((o for o in files if o['path'] not in skip), key=lambda o: o['t_ms'])
+    upcoming = {}  # path -> its observations not yet reached
+    for o in ordered:
+        upcoming.setdefault(o['path'], collections.deque()).append(o)
+    tool_calls, history, makers, alerts = calls(claims), {}, {}, []
+    for o in ordered:
+        upcoming[o['path']].popleft()
+        before, made = history.setdefault(o['path'], []), makers.setdefault(o['path'], [])
+        covering = [c for c in tool_calls if covers(c, o) and left(c, o, upcoming[o['path']])]
         by = max(covering, key=lambda c: c['start'], default=None)  # the most recent call that could have made it
         kinds = []
         if o['kind'] == 'change' and by is None:
             kinds.append('UNCLAIMED')
-        if o['kind'] in ('startup', 'rescan', 'checkpoint') and before:
+        # a sweep or rescan reports what the stream missed; a startup scan does too, once the project's first sweep is done
+        if o['kind'] in ('startup', 'rescan', 'checkpoint') and (before or o['kind'] != 'startup' or any(
+                t < o['t_ms'] and under(o['path'], root) for root, t in enrolled.items())):
             kinds.append('UNWATCHED' if o['kind'] == 'startup' else 'PARTIAL')
         spans = [(p['t_ms'], (before + [o])[i + 1]['t_ms']) for i, p in enumerate(before[:-1])
                  if o.get('sha256') is not None and p.get('sha256') == o['sha256']]
         if spans:
             kinds.append('REVERTED' if by is not None and names(by, o['path']) else 'STALE-REVERT')
-        if kinds and o['kind'] == 'change' and git_operation(o, covering, moves, home):  # git's evidence outranks a time window
+        if kinds and o['kind'] == 'change' and git_operation(o, covering, moves, home, upcoming[o['path']]):  # git's evidence outranks a time window
             kinds = ['GIT']
         if kinds:
             previous = before[-1] if before else None
             basis = evidence(o, by, previous) + (['git-index'] if 'STALE-REVERT' in kinds and index_refresh(o, markers, home) else [])
             alerts.append({'o': o, 'kinds': kinds, 'evidence': [b for b in basis if b != 'none'] or ['none'], 'by': by, 'previous': previous, 'held': spans,
-                           'undoes': previous and next((c for c in tool_calls if covers(c, previous)), None),
+                           'undoes': made[-1] if made else None,
                            'seen_by': [c for c in tool_calls if mentions(c, o['path']) and any(s <= c['start'] < e for s, e in spans)]})
         before.append(o)
+        made.append(by)
     return alerts
 
 
@@ -321,13 +396,24 @@ def lines(a, labels, home):
     if previous and previous.get('sha256'):
         out.append('  restore:  ' + restore_command(home, o['path'], o.get('sha256') or ABSENT, previous['sha256']))
         if o.get('sha256'):
-            old, new = [(home / 'versions' / s).read_text().splitlines(keepends=True) for s in (previous['sha256'], o['sha256'])]
-            out.append(''.join('    ' + line for line in difflib.unified_diff(old, new, 'before', 'after')).rstrip())
+            out.append(diff(home, previous['sha256'], o['sha256']))
     return out
 
 
+def diff(home, old, new):
+    """The change from one kept version to another, indented, or why it can't be shown."""
+    try:
+        old, new = [(home / 'versions' / s).read_bytes().decode().splitlines(keepends=True) for s in (old, new)]
+    except FileNotFoundError:  # a kept version was removed
+        return '    (no diff: a kept version is missing)'
+    except UnicodeDecodeError:  # binary, or text in another encoding
+        return '    (no diff: not UTF-8 text)'
+    return ''.join('    ' + line for line in difflib.unified_diff(old, new, 'before', 'after')).rstrip()
+
+
 def restore_command(home, path, expected, version):
-    return f"python3 '{Path(__file__).resolve()}' --home '{Path(home).resolve()}' --restore '{path}' {expected} {version}"
+    """The restore line, quoted for a POSIX shell: a file name is one argument whatever it holds."""
+    return shlex.join(['python3', str(Path(__file__).resolve()), '--home', str(Path(home).resolve()), '--restore', str(path), expected, version])
 
 
 def sha256(path):
@@ -420,22 +506,26 @@ def main():
     if a.restore:
         return restore(home, *a.restore)
     labels = {stamp(os.path.expanduser(marker)): name for name, marker in MARKERS.items() if os.path.exists(os.path.expanduser(marker))}
-    observations, project = load(home / 'observations.jsonl'), os.path.realpath(a.project)
+    damaged = {'observations.jsonl': [], 'claims.jsonl': []}
+    observations, project = load(home / 'observations.jsonl', damaged['observations.jsonl']), os.path.realpath(a.project)
     if not any(under(o['path'], project) for o in observations):  # there "0 alerts" would read as an all-clear
         raise SystemExit(f'nothing recorded under {project} on this machine, so no alert there means nothing. The watcher '
                          "runs only on macOS, needs swiftc for its first start, and needs the app's access to the folder; "
                          f'see {home / "watch.log"}.')
     if a.checkpoint:
-        answer, observations = request_checkpoint(home, project), load(home / 'observations.jsonl')  # with what the check found
+        answer, damaged['observations.jsonl'] = request_checkpoint(home, project), []
+        observations = load(home / 'observations.jsonl', damaged['observations.jsonl'])  # with what the check found
     else:  # an answer for this project only
         answer = next((o for o in observations if o['kind'] == 'sweep' and o.get('request') == a.answered and o['path'] == project), None)
-    found = [x for x in reconcile(observations, load(home / 'claims.jsonl'), home) if under(x['o']['path'], project)]
+    found = [x for x in reconcile(observations, load(home / 'claims.jsonl', damaged['claims.jsonl']), home) if under(x['o']['path'], project)]
+    broken = '; '.join(f"{name} line{'s' * (len(ns) > 1)} {', '.join(map(str, ns))}" for name, ns in damaged.items() if ns)
     alerts = [x for x in found if x['kinds'] != ['GIT']]
     if a.explain and alerts:
         print(f"--explain: sending {len(alerts)} alert(s) to Anthropic's API; keys, tokens and passwords are redacted first", file=sys.stderr)
     report(alerts, labels, home, a.diff, a.explain)
     print(f'{len(alerts)} alert(s); {len(found) - len(alerts)} change(s) made by git')
-    why = ('no check was asked for (run with --checkpoint)' if not (a.checkpoint or a.answered) else
+    why = (f'some ledger lines are not records, so what they held is not in this report ({broken})' if broken else
+           'no check was asked for (run with --checkpoint)' if not (a.checkpoint or a.answered) else
            'no watcher answered the check' if answer is None else
            None if answer['status'] == 'settled' else UNSETTLED.get(answer['status'], f"the watcher answered {answer['status']}"))
     print(f"State: {'ALERTS_PRESENT' if alerts else 'COVERAGE_UNKNOWN' if why else 'NO_ALERTS_OBSERVED'} under {project}.")

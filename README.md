@@ -24,11 +24,18 @@ It needs macOS, and `python3` and `swiftc`, both from Xcode's command-line tools
 - **STALE-REVERT:** a file went back to content it held earlier, and no call aimed at that file made the change. This
   is the pattern of a stale copy overwriting newer work.
 - **REVERTED:** the same, made by a call that named the file.
-- **UNWATCHED:** a file changed while the watcher wasn't running, found when it started again.
-- **PARTIAL:** found by a rescan after macOS dropped file events; it can't be attributed.
+- **UNWATCHED:** a file changed, added or deleted while the watcher wasn't running, found when it started again.
+- **PARTIAL:** a change the event stream missed, found by a later comparison or by a rescan after macOS dropped file
+  events; it can't be attributed.
 
-Checkouts, stashes, merges and commits are counted as git operations, not alerted. `git restore` leaves no trace a
-stale write wouldn't, so it stays an alert, labelled `git-index`.
+An agent's call claims only what it left: a file named by the call, or a change under a shell command's folder, and
+only if the file ends up as the call's own hook recorded it. A different version, even a moment later, is someone
+else's. A Codex patch claims only the files it names.
+
+Checkouts, stashes, merges and commits are counted as git operations, not alerted, when git's own reflog shows the
+content they put there. An agent's `git checkout -- <file>` or `git restore <file>` counts too, when the command names
+the file and git stores the content it now holds; command text alone never does. Run by you, `git restore` leaves no
+trace a stale write wouldn't, so it stays an alert, labelled `git-index`.
 
 ## What it can't tell you
 
@@ -40,8 +47,10 @@ stale write wouldn't, so it stays an alert, labelled `git-index`.
 - **Overlapping shell work.** Two agents running shell commands in one folder at the same time can cover each other's
   writes, because a shell write is attributed to the call whose time window it falls in.
 - **Fast or large writes.** Two writes within about 50 ms keep only the last version. Files over 64 MB are not tracked.
-- **Files it can't read.** A file the watcher can't read is skipped, never recorded as deleted, so its content isn't
-  vouched for while it stays unreadable.
+- **Files it can't read.** A file or folder the watcher can't read is skipped, never recorded as deleted, and a check
+  says coverage is unknown while it stays unreadable.
+- **A formatter run by a hook.** A hook that reformats a file after the agent's tool, alongside this plugin's own,
+  can leave a version the agent's call didn't: that shows as `UNCLAIMED`, which is what happened on disk.
 
 ## Alerts
 
@@ -51,12 +60,13 @@ stale write wouldn't, so it stays an alert, labelled `git-index`.
   with a state, never "clean": `ALERTS_PRESENT`; `NO_ALERTS_OBSERVED`, when the watcher has just compared every file
   with its last record, found them all matching and unchanged while it compared them, and no recorded change raised an
   alert; or `COVERAGE_UNKNOWN`, with the reason: no watcher answered within 15 s, it could not read the folder or some
-  of its files, or files kept changing. With no records at all, it says it can't tell.
+  of its files, files kept changing, or some ledger lines are damaged. With no records at all, it says it can't tell.
 
 ## Recovery is guarded
 
-Each alert prints one restore command. It puts back the exact bytes and permissions of the version before the change,
-and only if the file still has the hash the alert saw. If the file changed since, it refuses and prints the command
+Each alert prints one restore command, quoted so any file name stays one argument. It puts back the exact bytes of the
+version before the change, keeping the file's current permissions, and only if the file still has the hash the alert
+saw. A deleted file comes back with default permissions. If the file changed since, it refuses and prints the command
 that would override. Nothing is restored automatically. The check and the replacement are two steps, so a write that
 lands between them is lost, and the restore itself shows up as an alert.
 
@@ -104,7 +114,8 @@ pkill -f "$HOME/.agent-ledger/bin/watch-"
 rm -rf ~/.agent-ledger
 ```
 
-The second line stops the watcher now instead of at its idle exit. The last line deletes the ledger, including the
+The second line stops the watcher now instead of at its idle exit. After `claude plugin update`, run it too: a watcher
+from the earlier version keeps running while sessions stay active, and the next session starts the new one. The last line deletes the ledger, including the
 kept copies of your files.
 
 ## License

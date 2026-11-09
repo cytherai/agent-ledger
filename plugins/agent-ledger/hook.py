@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -41,9 +42,9 @@ def claim(agent, event, now_ms):
     named = [tool_input[k] for k in PATH_KEYS if isinstance(tool_input.get(k), str)]
     patches = [s for s in strings(tool_input) if '*** Begin Patch' in s]
     named += [a or b for p in patches for a, b in PATCH_FILE.findall(p)]
-    command = tool_input.get('command', tool_input.get('cmd'))
+    command = None if patches else tool_input.get('command', tool_input.get('cmd'))  # a patch writes only the files it names
     if isinstance(command, list):
-        command = ' '.join(c for c in command if '*** Begin Patch' not in c)
+        command = ' '.join(c for c in command if isinstance(c, str))
     record = {'schema': 1, 't_ms': now_ms, 'agent': agent, 'event': event.get('hook_event_name'), 'session': event.get('session_id'),
               'turn': event.get('turn_id'), 'tool': event.get('tool_name'), 'tool_use_id': event.get('tool_use_id'),
               'cwd': cwd, 'command': command or tool_input.get('code'), 'paths': sorted({canonical(os.path.join(cwd, p)) for p in named})}
@@ -93,7 +94,7 @@ def announce(root):
     if new:
         shown[root] = max(a['o']['t_ms'] for a in new)
         (HOME / 'shown.json').write_text(json.dumps(shown))
-        check = f"python3 '{Path(__file__).resolve().with_name('reconcile.py')}' --home '{HOME}' --project '{root}' --diff"
+        check = shlex.join(['python3', str(Path(__file__).resolve().with_name('reconcile.py')), '--home', str(HOME), '--project', root, '--diff'])
         print(json.dumps({'systemMessage': f'Agent Ledger: {len(new)} new alert(s) in this project. Details and restore lines: '
                                            f'/agent-ledger:check in Claude Code, or {check}\n' + '\n'.join(map(r.headline, new))}))
 
@@ -125,8 +126,10 @@ def main():
     if sys.argv[1] == 'launch':
         return launch()
     record = claim(sys.argv[1], json.load(sys.stdin), round(time.time() * 1000))
-    with open(HOME / 'claims.jsonl', 'a') as f:
-        f.write(json.dumps(record, sort_keys=True) + '\n')
+    with open(HOME / 'claims.jsonl', 'a+b') as f:
+        f.seek(0, os.SEEK_END)
+        cut = f.tell() > 0 and (f.seek(-1, os.SEEK_END), f.read(1))[1] != b'\n'  # a line cut short: end it, so this one stands alone
+        f.write(b'\n' * cut + json.dumps(record, sort_keys=True).encode() + b'\n')
     root = register(record['cwd']) if record['event'] == 'SessionStart' else None
     ensure_watcher()
     if root:
