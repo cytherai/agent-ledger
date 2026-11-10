@@ -14,8 +14,8 @@ a running watcher notices by itself; every event starts a watcher, detached into
 holds HOME/watch.lock. The first start compiles watch.swift, cached by its hash. `hook.py launch` is that detached
 step: compile if needed, then become the watcher.
 """
-import fcntl
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -27,10 +27,12 @@ import unicodedata
 from pathlib import Path
 
 HOME = Path(os.environ.get('AGENT_LEDGER_HOME', Path.home() / '.agent-ledger'))
+RETRY_S = 600  # how long a failed build of the watcher stands before another is tried
 PATH_KEYS = ('file_path', 'path', 'notebook_path', 'filePath')
 PATCH_FILE = re.compile(r'^\*\*\* (?:Add|Update|Delete) File: (.+)$|^\*\*\* Move to: (.+)$', re.M)
-HEREDOC = re.compile(r"""cat\s*(>>?)\s*(\S+)\s*<<-?\s*(['"])(\w+)\3[^\n]*\n(.*?\n)??\4[ \t]*(?=\n|$)""", re.S)  # quoted: its body is literal
-REDIRECT = re.compile(r'(?<![0-9&<>])(>>?)\s*([^\s;&|<>()]+)')
+HEREDOC = re.compile(r"""<<-?\s*(['"]?)(\w+)\1([^\n]*)\n((?:.*?\n)??)\2[ \t]*(?=\n|$)""", re.S)
+CONTROL = {'if', 'then', 'else', 'elif', 'fi', 'for', 'while', 'until', 'do', 'done', 'case', 'esac', 'function', '{', '}', '(', ')',
+           'exit', 'return', 'exec', 'eval', 'set', 'trap'}
 
 
 def strings(tool_input):
@@ -50,8 +52,10 @@ def expects(tool, tool_input, cwd, command, read=content):
     """What a call is set to leave in the files it writes, worked out before it runs: {path: SHA-256, or None when only
     the target is known}. None for a tool this cannot read. A Write leaves its content. An Edit leaves the file with its
     one replacement made (or all, when asked), if the text before it allows exactly that. A shell command writes the
-    files it redirects into, and `cat > f <<'EOF'` leaves its literal body there (`>>` after what the file held); it is
-    given no other file, whatever else its text mentions. `read` returns a file's bytes, or None."""
+    files it redirects into where its text shows that part must run: an unquoted `>` or `>>`, not after `&&`, `||` or
+    `|`, in a command with no control flow. `cat > f <<'EOF'` leaves its literal body there (`>>` after what the file
+    held). It is given no other file, whatever its text mentions or quotes. What a call is set to leave is no proof
+    that it ran. `read` returns a file's bytes, or None."""
     at = lambda p: canonical(os.path.join(cwd, p))
     path = tool_input.get('file_path')
     if tool == 'Write' and isinstance(path, str) and isinstance(tool_input.get('content'), str):
@@ -67,17 +71,31 @@ def expects(tool, tool_input, cwd, command, read=content):
         return {at(path): hashlib.sha256(text.replace(old, new).encode()).hexdigest()}
     if not isinstance(command, str):
         return None
-    writes = [(m.start(), m.group(1), m.group(2), (m.group(5) or '').encode()) for m in HEREDOC.finditer(command)]
-    rest = HEREDOC.sub(lambda m: ' ' * len(m.group(0)), command)  # a body's own text is no redirection
-    writes += [(m.start(), m.group(1), m.group(2), None) for m in REDIRECT.finditer(rest)]
+    bodies = []  # each here-document's (body, whether it is literal), its text taken out of the command
+
+    def take(m):
+        bodies.append((m.group(4).encode(), bool(m.group(1))))
+        return f' <<HERE{len(bodies) - 1} {m.group(3)}'  # the rest of its line is still the command
+    lexer = shlex.shlex(HEREDOC.sub(take, command).replace('\n', ' ; '), posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True  # quoted text is one word, never an operator
+    try:
+        words = list(lexer)
+    except ValueError:  # unbalanced quotes: not a command this can read
+        return {}
+    if CONTROL & set(words):
+        return {}  # which of its parts run is for the shell to decide, not its text
     left = {}
-    for _, how, target, body in sorted(writes, key=lambda w: w[0]):
-        target = target.strip('\'"')
-        if target.startswith('/dev/') or '$' in target:
-            continue
-        p = at(target)
-        before = (left[p] if p in left else read(p) or b'') if how == '>>' else b''
-        left[p] = None if body is None or before is None else before + body
+    for sure, step in itertools.groupby(words, lambda w: w in (';', '&')):
+        step = list(itertools.takewhile(lambda w: w not in ('&&', '||', '|'), step))  # what follows these may not run
+        here = [bodies[int(w[4:])] for i, w in enumerate(step) if step[i - 1:i] == ['<<'] and w.startswith('HERE')]
+        for i, how in enumerate(step[:-1]):
+            target = step[i + 1]
+            if sure or how not in ('>', '>>') or target.startswith('/dev/') or '$' in target:
+                continue
+            literal = step[0] == 'cat' and len(here) == 1 and here[0][1] and len(step) == 5  # cat, a redirection, one literal here-document
+            p = at(target)
+            before = (left[p] if p in left else read(p) or b'') if how == '>>' else b''
+            left[p] = before + here[0][0] if literal and before is not None else None
     return {p: data if data is None else hashlib.sha256(data).hexdigest() for p, data in left.items()}
 
 
@@ -148,38 +166,90 @@ def announce(root):
 
 
 def ensure_watcher():
-    """Starts a detached watcher unless one already holds the lock."""
-    with open(HOME / 'watch.lock', 'a') as lock:
+    """Starts a detached watcher unless one runs or is being started. Returns why none can be, when its last build
+    failed less than RETRY_S ago, else None. The start holds HOME/setup.lock from here until the watcher exits: the lock
+    passes to the launcher and then to the watcher it becomes, so hooks arriving meanwhile start nothing, and a launcher
+    that is killed frees it."""
+    import fcntl  # macOS only, like everything from here
+    with open(HOME / 'watch.lock', 'a') as running:
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(running, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:  # a watcher holds it
-            return
-    with open(HOME / 'watch.log', 'a') as log:
-        subprocess.Popen([sys.executable, __file__, 'launch'], start_new_session=True, stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+            return None
+    with open(HOME / 'setup.lock', 'a') as starting:
+        try:
+            fcntl.flock(starting, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:  # being built or started
+            return None
+        failed = setup(HOME)
+        if failed.get('state') == 'failed' and failed.get('binary') == watcher().name and time.time() * 1000 - failed.get('t_ms', 0) < RETRY_S * 1000:
+            return str(failed.get('reason'))
+        with open(HOME / 'watch.log', 'a') as log:
+            subprocess.Popen([sys.executable, __file__, 'launch'], pass_fds=[starting.fileno()], start_new_session=True,
+                             stdin=subprocess.DEVNULL, stdout=log, stderr=log)
+    return None
+
+
+def setup(home):
+    """The last build's note, HOME/setup.json, or {} when there is none or it cannot be read as one: it describes, and
+    the locks decide. A note cut short must not stop the next start, nor stand for a state."""
+    try:
+        note = json.loads(Path(home, 'setup.json').read_text())
+    except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError):  # gone since it was listed, or damaged
+        return {}
+    return note if isinstance(note, dict) else {}
+
+
+def watcher():
+    """Where this version's watcher is kept, named by its source's hash."""
+    return HOME / 'bin' / ('watch-' + hashlib.sha256(Path(__file__).with_name('watch.swift').read_bytes()).hexdigest()[:12])
 
 
 def launch():
-    source = Path(__file__).with_name('watch.swift')
-    binary = HOME / 'bin' / ('watch-' + hashlib.sha256(source.read_bytes()).hexdigest()[:12])
+    """Builds the watcher if this version's is not kept yet, then becomes it. The state of a build is in
+    HOME/setup.json: "building" while it runs (true only while setup.lock is held), or "failed" with the reason."""
+    binary, status = watcher(), HOME / 'setup.json'
+    def state(state, **more):  # written whole, then put in place in one step
+        draft = status.with_name(f'setup.json.{os.getpid()}')
+        draft.write_text(json.dumps({'state': state, 'binary': binary.name, 't_ms': round(time.time() * 1000), **more}))
+        draft.replace(status)
     if not binary.exists():
         binary.parent.mkdir(mode=0o700, exist_ok=True)
         building = binary.with_name(f'{binary.name}.{os.getpid()}')
-        subprocess.run(['swiftc', '-O', '-o', str(building), str(source)], check=True)
+        state('building')
+        try:
+            subprocess.run(['swiftc', '-O', '-o', str(building), str(Path(__file__).with_name('watch.swift'))], check=True, capture_output=True, text=True)
+        except FileNotFoundError:
+            return state('failed', reason="swiftc is not installed; install Xcode's command-line tools with `xcode-select --install`")
+        except subprocess.CalledProcessError as e:
+            return state('failed', reason='swiftc could not build the watcher: ' + ((e.stderr or '').strip().splitlines() or ['no message'])[-1][:300])
         building.replace(binary)
+    status.unlink(missing_ok=True)
     os.execv(binary, [str(binary), str(HOME)])
 
 
 def main():
+    if sys.platform != 'darwin':  # before anything is created, recorded or started
+        if sys.argv[1] != 'launch' and json.load(sys.stdin).get('hook_event_name') == 'SessionStart':
+            print(json.dumps({'systemMessage': 'Agent Ledger works only on macOS. On this machine it records nothing and watches '
+                                               'nothing; you can uninstall it.'}))
+        return
     HOME.mkdir(mode=0o700, parents=True, exist_ok=True)  # the ledger describes source code: owner-only
     if sys.argv[1] == 'launch':
         return launch()
-    record = claim(sys.argv[1], json.load(sys.stdin), round(time.time() * 1000))
+    event = json.load(sys.stdin)
+    record = claim(sys.argv[1], event, round(time.time() * 1000))
+    root = register(record['cwd']) if record['event'] == 'SessionStart' else None  # before the watcher starts: it needs a project
+    failed = ensure_watcher()
+    if failed:  # nothing is watched, so nothing the agent does is recorded either
+        if root:
+            print(json.dumps({'systemMessage': f'Agent Ledger is not running: {failed}. It records nothing until its watcher can be '
+                                               f'built, and tries again every {RETRY_S // 60} minutes.'}))
+        return
     with open(HOME / 'claims.jsonl', 'a+b') as f:
         f.seek(0, os.SEEK_END)
         cut = f.tell() > 0 and (f.seek(-1, os.SEEK_END), f.read(1))[1] != b'\n'  # a line cut short: end it, so this one stands alone
         f.write(b'\n' * cut + json.dumps(record, sort_keys=True).encode() + b'\n')
-    root = register(record['cwd']) if record['event'] == 'SessionStart' else None
-    ensure_watcher()
     if root:
         announce(root)  # after the watcher starts, so a failure here never stops the recording
 

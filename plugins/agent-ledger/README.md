@@ -1,7 +1,12 @@
 # Agent Ledger
 
-Agent Ledger flags file changes that no coding agent claimed, and keeps earlier versions so you can put a file back
-with a guarded restore. It is a Claude Code plugin for macOS.
+**macOS only.** Agent Ledger flags file changes that no coding agent claimed, and keeps earlier versions so you can
+put a file back with a guarded restore. It is a Claude Code plugin.
+
+**Before you install: it keeps copies of your files.** Each distinct version of a file that changes in a project
+where you run a session is kept in `~/.agent-ledger`, readable only by you. That includes files git ignores, such as
+`.env`. Nothing is sent automatically; the optional `--explain` report sends an alert's facts and diff to Anthropic
+when you ask for it. Nothing is pruned. To stop it and delete everything, see [Uninstall](#uninstall).
 
 When two agents, or an agent and an editor, work in the same folder, one can silently undo another's edit, and each
 agent's own log clears it, because each knows only what it did. Agent Ledger compares what agents say they change,
@@ -18,6 +23,13 @@ claude plugin install agent-ledger@cytherai
 Or, in a session on Claude Code 2.1.275 or later: `/plugin install agent-ledger --marketplace cytherai/agent-ledger`.
 It needs macOS, and `python3` and `swiftc`, both from Xcode's command-line tools (`xcode-select --install`).
 
+- **On Linux or Windows** it does nothing: it records nothing, starts nothing, and says so once at the start of a
+  session. Without `python3` its hooks are skipped. This has been checked by simulating those systems, not on them.
+- **The first session builds the watcher,** which takes a little while. Until it runs, `/agent-ledger:check` says
+  coverage is unknown because the watcher is still being built.
+- **If the build fails,** for example without the command-line tools, the session start says why. Nothing is recorded
+  while no watcher runs, and it tries again every 10 minutes.
+
 ## What it detects
 
 - **UNCLAIMED:** a file changed and no agent's tool call covers the change.
@@ -29,8 +41,9 @@ It needs macOS, and `python3` and `swiftc`, both from Xcode's command-line tools
   events; it can't be attributed.
 
 An agent's call claims only what it is set to write. Before a Write, an Edit or a shell command runs, the plugin works
-out what it will leave: the Write's content, the Edit's result, the files a shell command redirects into. A different
-version, even a moment later, is someone else's. A shell command does not cover its folder: a change it doesn't write
+out what it will leave: the Write's content, the Edit's result, the files a shell command plainly redirects into. Only
+that version, at its first appearance while the call ran, counts as the agent's, and only for a call that finished. If
+an outside process writes the very same bytes at that moment, the plugin can't tell. A shell command does not cover its folder: a change it doesn't write
 by its own text is `UNCLAIMED`, with the command named as running at the time. That includes files written by a script
 the command runs, which the plugin can't see into. A Codex patch claims only the files it names.
 

@@ -1,8 +1,8 @@
 {
   "name": "agent-ledger",
   "displayName": "Agent Ledger",
-  "version": "0.1.6",
-  "description": "Flags file changes no coding agent claimed and keeps earlier versions for a guarded restore. Claude Code on macOS",
+  "version": "0.1.7",
+  "description": "macOS only. Flags file changes no coding agent claimed and keeps earlier versions for a guarded restore, in Claude Code",
   "author": { "name": "CytherAI", "url": "https://cytherai.com" },
   "homepage": "https://cytherai.com",
   "license": "Apache-2.0",

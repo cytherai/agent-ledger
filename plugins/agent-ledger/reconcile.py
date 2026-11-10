@@ -109,7 +109,7 @@ def calls(claims):
     merged = {}
     for c in sorted((c for c in claims if c['event'] != 'SessionStart'), key=lambda c: c['t_ms']):
         call = merged.setdefault((c['agent'], c['session'], c['tool_use_id']), {**c, 'start': c['t_ms'], 'sha256': {}, 'paths': []})
-        call['end'], call['failed'] = c['t_ms'], c['event'] == 'PostToolUseFailure'
+        call['end'], call['failed'], call['ended'] = c['t_ms'], c['event'] == 'PostToolUseFailure', c['event'] != 'PreToolUse'
         call['sha256'].update(c.get('sha256') or {})
         call['paths'] = sorted(set(call['paths']) | set(c['paths']))
     return list(merged.values())
@@ -150,24 +150,36 @@ def blind_shell(call):
     return 'expects' not in call and bool(call.get('command')) and call['tool'] != 'apply_patch'  # before 0.1.4 a patch kept a command
 
 
-def covers(call, o, upcoming=()):
-    """Whether `o` is the call's work, by evidence in this order. What the call was set to leave in the file (worked
-    out before it ran): `o` must be that version, or on the way to it within the window; a redirection whose content
-    is unknown takes any version; a failed Edit or Write wrote nothing. Else, for a file the call named: the version
-    its hook sampled from disk afterwards, the same way (weaker: an outside write just before the sample passes for
-    the call's). Else a shell call from before 0.1.6 takes anything under its folder."""
+def covers(call, o, upcoming=(), earlier=()):
+    """Whether `o` is the call's work. A window, what a call was set to leave, and what was seen on disk are three
+    things; none alone makes a writer. A call with no recorded end is not known to have run, and claims nothing. A
+    version is the call's when it is what the call was set to leave (worked out before it ran) at its first arrival in
+    the window: once that has arrived, any later version is someone else's, that content coming back included. Before
+    it arrives, a version counts as on the way only if the file was emptied or removed (how a file is replaced), or
+    the call is a shell command, which may write in steps. A redirection whose content is unknown takes any version; a
+    failed Edit or Write wrote nothing. Where nothing was foretold for a file the call named, the version its hook
+    sampled from disk afterwards stands in, the same way (weaker: an outside write just before the sample passes for
+    the call's). A shell call from before 0.1.6 takes anything under its folder."""
     if not within(call, o):
         return False
-    reached = lambda h: any(v.get('sha256') == h for v in itertools.takewhile(lambda v: v['t_ms'] <= call['end'] + GRACE_MS, itertools.chain([o], upcoming)))
-    foretold, sampled = ({key(p): h for p, h in (call.get(field) or {}).items()} for field in ('expects', 'sha256'))
     path = key(o['path'])
+    if blind_shell(call):
+        return names(call, o['path']) or path.startswith(key(call['cwd']).rstrip('/') + '/')
+    if not call['ended']:
+        return False
+    limit = call['end'] + GRACE_MS
+
+    def its(h):
+        if any(v.get('sha256') == h and v['t_ms'] >= call['start'] for v in earlier):
+            return False  # it had already arrived
+        on_the_way = o.get('sha256') in (None, EMPTY) or bool(call.get('command'))
+        return o.get('sha256') == h or (on_the_way and any(v.get('sha256') == h for v in itertools.takewhile(lambda v: v['t_ms'] <= limit, upcoming)))
+    foretold, sampled = ({key(p): h for p, h in (call.get(field) or {}).items()} for field in ('expects', 'sha256'))
     if path in foretold:
         if call['failed'] and not call.get('command'):
             return False
-        return foretold[path] is None or reached(foretold[path])
-    if names(call, o['path']):
-        return path not in sampled or reached(sampled[path])
-    return blind_shell(call) and path.startswith(key(call['cwd']).rstrip('/') + '/')
+        return foretold[path] is None or its(foretold[path])
+    return names(call, o['path']) and (path not in sampled or its(sampled[path]))
 
 
 @functools.cache
@@ -308,6 +320,26 @@ def swept(observations, root):
     return start['t_ms'], beats[last]['t_ms']
 
 
+def no_answer(home):
+    """Why no watcher answered a check, from the ledger's locks and its record of the last build."""
+    if sys.platform != 'darwin':
+        return 'Agent Ledger watches only on macOS'
+    import fcntl
+
+    def held(name):
+        with open(Path(home, name), 'a') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+        return False
+    import hook  # its reader of the build's note takes a missing or damaged one as none
+    setup = hook.setup(home)
+    return ('a watcher is running but did not answer in time' if held('watch.lock') else
+            'the watcher is still being built or started (its first start compiles it); nothing is compared until it runs' if held('setup.lock') else
+            f"the watcher could not be built: {setup.get('reason')}" if setup.get('state') == 'failed' else 'no watcher is running')
+
+
 def request_checkpoint(home, project, wait=CHECK_WAIT_S):
     """Asks the running watcher to compare `project` with its records now. Returns the `sweep` record it writes once
     that is complete, or None when none came within `wait` seconds; the request is then withdrawn."""
@@ -345,7 +377,7 @@ def reconcile(observations, claims, home=None):
     for o in ordered:
         upcoming[o['path']].popleft()
         before, made = history.setdefault(o['path'], []), makers.setdefault(o['path'], [])
-        covering = [c for c in tool_calls if covers(c, o, upcoming[o['path']])]
+        covering = [c for c in tool_calls if covers(c, o, upcoming[o['path']], before)]
         by = max(covering, key=lambda c: c['start'], default=None)  # the most recent call that could have made it
         during = None if by else max((c for c in tool_calls if c.get('command') and within(c, o)), key=lambda c: c['start'], default=None)
         kinds = []
@@ -527,7 +559,8 @@ def main():
     damaged = {'observations.jsonl': [], 'claims.jsonl': []}
     observations, project = load(home / 'observations.jsonl', damaged['observations.jsonl']), os.path.realpath(a.project)
     if not any(under(o['path'], project) for o in observations):  # there "0 alerts" would read as an all-clear
-        raise SystemExit(f'nothing recorded under {project} on this machine, so no alert there means nothing. The watcher '
+        raise SystemExit(('' if sys.platform == 'darwin' else 'Agent Ledger watches only on macOS, and this is not macOS. ') +
+                         f'nothing recorded under {project} on this machine, so no alert there means nothing. The watcher '
                          "runs only on macOS, needs swiftc for its first start, and needs the app's access to the folder; "
                          f'see {home / "watch.log"}.')
     if a.checkpoint:
@@ -544,7 +577,7 @@ def main():
     print(f'{len(alerts)} alert(s); {len(found) - len(alerts)} change(s) made by git')
     why = (f'some ledger lines are not records, so what they held is not in this report ({broken})' if broken else
            'no check was asked for (run with --checkpoint)' if not (a.checkpoint or a.answered) else
-           'no watcher answered the check' if answer is None else
+           (f'no watcher answered the check: {no_answer(home)}' if a.checkpoint else 'no watcher answered the check') if answer is None else
            None if answer['status'] == 'settled' else UNSETTLED.get(answer['status'], f"the watcher answered {answer['status']}"))
     print(f"State: {'ALERTS_PRESENT' if alerts else 'COVERAGE_UNKNOWN' if why else 'NO_ALERTS_OBSERVED'} under {project}.")
     if why:

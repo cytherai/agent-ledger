@@ -1,7 +1,7 @@
 {
   "name": "cytherai",
   "owner": { "name": "CytherAI", "url": "https://cytherai.com" },
-  "description": "Agent Ledger: flags file changes no coding agent claimed, with a guarded restore",
+  "description": "macOS only. Agent Ledger: flags file changes no coding agent claimed, with a guarded restore",
   "plugins": [
     { "name": "agent-ledger", "source": "./plugins/agent-ledger" }
   ]
