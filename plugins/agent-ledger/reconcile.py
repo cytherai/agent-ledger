@@ -109,7 +109,7 @@ def calls(claims):
     merged = {}
     for c in sorted((c for c in claims if c['event'] != 'SessionStart'), key=lambda c: c['t_ms']):
         call = merged.setdefault((c['agent'], c['session'], c['tool_use_id']), {**c, 'start': c['t_ms'], 'sha256': {}, 'paths': []})
-        call['end'] = c['t_ms']
+        call['end'], call['failed'] = c['t_ms'], c['event'] == 'PostToolUseFailure'
         call['sha256'].update(c.get('sha256') or {})
         call['paths'] = sorted(set(call['paths']) | set(c['paths']))
     return list(merged.values())
@@ -139,21 +139,35 @@ def names(call, path):
     return key(path) in {key(p) for p in call['paths']}
 
 
-def covers(call, o):
-    if call['tool'] in READ_ONLY or not call['start'] <= o['t_ms'] <= call['end'] + GRACE_MS:
+def within(call, o):
+    """Whether the change was recorded in the call's window, which runs GRACE_MS past its end for the watcher's
+    delay. That makes the call a candidate, never by itself the writer."""
+    return call['tool'] not in READ_ONLY and call['start'] <= o['t_ms'] <= call['end'] + GRACE_MS
+
+
+def blind_shell(call):
+    """A shell call recorded before 0.1.6, with no account of what it writes: it covers its whole folder."""
+    return 'expects' not in call and bool(call.get('command')) and call['tool'] != 'apply_patch'  # before 0.1.4 a patch kept a command
+
+
+def covers(call, o, upcoming=()):
+    """Whether `o` is the call's work, by evidence in this order. What the call was set to leave in the file (worked
+    out before it ran): `o` must be that version, or on the way to it within the window; a redirection whose content
+    is unknown takes any version; a failed Edit or Write wrote nothing. Else, for a file the call named: the version
+    its hook sampled from disk afterwards, the same way (weaker: an outside write just before the sample passes for
+    the call's). Else a shell call from before 0.1.6 takes anything under its folder."""
+    if not within(call, o):
         return False
-    shell = bool(call.get('command')) and call['tool'] != 'apply_patch'  # hooks before 0.1.4 kept a patch as its command
-    return names(call, o['path']) or (shell and key(o['path']).startswith(key(call['cwd']).rstrip('/') + '/'))
-
-
-def left(call, o, upcoming):
-    """Whether `o` can be the call's work: the call recorded no result for this file, or left exactly this version, or
-    left a version still to come within its window, so `o` was on the way to it. A different last version is not its."""
-    results = {key(p): h for p, h in call['sha256'].items()}
-    if key(o['path']) not in results:
-        return True
-    end = call['end'] + GRACE_MS
-    return any(v.get('sha256') == results[key(o['path'])] for v in itertools.takewhile(lambda v: v['t_ms'] <= end, itertools.chain([o], upcoming)))
+    reached = lambda h: any(v.get('sha256') == h for v in itertools.takewhile(lambda v: v['t_ms'] <= call['end'] + GRACE_MS, itertools.chain([o], upcoming)))
+    foretold, sampled = ({key(p): h for p, h in (call.get(field) or {}).items()} for field in ('expects', 'sha256'))
+    path = key(o['path'])
+    if path in foretold:
+        if call['failed'] and not call.get('command'):
+            return False
+        return foretold[path] is None or reached(foretold[path])
+    if names(call, o['path']):
+        return path not in sampled or reached(sampled[path])
+    return blind_shell(call) and path.startswith(key(call['cwd']).rstrip('/') + '/')
 
 
 @functools.cache
@@ -273,7 +287,7 @@ def new_stamp(o, previous):
 
 
 def evidence(o, by, previous):
-    basis = ['hook-claim' if names(by, o['path']) else 'time-window'] if by else []
+    basis = ['hook-claim' if names(by, o['path']) else 'time-window' if blind_shell(by) else 'shell-target'] if by else []
     basis += ['provenance'] if new_stamp(o, previous) else []
     basis += {'startup': ['rescan'], 'rescan': ['rescan'], 'checkpoint': ['checkpoint']}.get(o['kind'], [])
     return basis or ['none']
@@ -331,8 +345,9 @@ def reconcile(observations, claims, home=None):
     for o in ordered:
         upcoming[o['path']].popleft()
         before, made = history.setdefault(o['path'], []), makers.setdefault(o['path'], [])
-        covering = [c for c in tool_calls if covers(c, o) and left(c, o, upcoming[o['path']])]
+        covering = [c for c in tool_calls if covers(c, o, upcoming[o['path']])]
         by = max(covering, key=lambda c: c['start'], default=None)  # the most recent call that could have made it
+        during = None if by else max((c for c in tool_calls if c.get('command') and within(c, o)), key=lambda c: c['start'], default=None)
         kinds = []
         if o['kind'] == 'change' and by is None:
             kinds.append('UNCLAIMED')
@@ -349,7 +364,7 @@ def reconcile(observations, claims, home=None):
         if kinds:
             previous = before[-1] if before else None
             basis = evidence(o, by, previous) + (['git-index'] if 'STALE-REVERT' in kinds and index_refresh(o, markers, home) else [])
-            alerts.append({'o': o, 'kinds': kinds, 'evidence': [b for b in basis if b != 'none'] or ['none'], 'by': by, 'previous': previous, 'held': spans,
+            alerts.append({'o': o, 'kinds': kinds, 'evidence': [b for b in basis if b != 'none'] or ['none'], 'by': by, 'during': during, 'previous': previous, 'held': spans,
                            'undoes': made[-1] if made else None,
                            'seen_by': [c for c in tool_calls if mentions(c, o['path']) and any(s <= c['start'] < e for s, e in spans)]})
         before.append(o)
@@ -388,6 +403,7 @@ def lines(a, labels, home):
     if a['by'] is None:
         app = new_stamp(o, previous) and labels.get(o['provenance'], f"an app with provenance {o['provenance']}")
         out.append('  writer:   not established: no agent claimed this change'
+                   + (f"; it came while {describe(a['during'])} ran, which does not write this file by its text" if a['during'] else '')
                    + (f'; a provenance stamp of {app} appeared with this version' if app else ''))
     else:
         out.append(f"  writer:   {describe(a['by'])}")

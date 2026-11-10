@@ -29,12 +29,56 @@ from pathlib import Path
 HOME = Path(os.environ.get('AGENT_LEDGER_HOME', Path.home() / '.agent-ledger'))
 PATH_KEYS = ('file_path', 'path', 'notebook_path', 'filePath')
 PATCH_FILE = re.compile(r'^\*\*\* (?:Add|Update|Delete) File: (.+)$|^\*\*\* Move to: (.+)$', re.M)
+HEREDOC = re.compile(r"""cat\s*(>>?)\s*(\S+)\s*<<-?\s*(['"])(\w+)\3[^\n]*\n(.*?\n)??\4[ \t]*(?=\n|$)""", re.S)  # quoted: its body is literal
+REDIRECT = re.compile(r'(?<![0-9&<>])(>>?)\s*([^\s;&|<>()]+)')
 
 
 def strings(tool_input):
     """Every string value in the tool input, one level into lists (Codex passes commands as argument lists)."""
     for value in tool_input.values():
         yield from [value] if isinstance(value, str) else [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
+
+
+def content(path):
+    try:
+        return Path(path).read_bytes()
+    except (FileNotFoundError, IsADirectoryError):
+        return None
+
+
+def expects(tool, tool_input, cwd, command, read=content):
+    """What a call is set to leave in the files it writes, worked out before it runs: {path: SHA-256, or None when only
+    the target is known}. None for a tool this cannot read. A Write leaves its content. An Edit leaves the file with its
+    one replacement made (or all, when asked), if the text before it allows exactly that. A shell command writes the
+    files it redirects into, and `cat > f <<'EOF'` leaves its literal body there (`>>` after what the file held); it is
+    given no other file, whatever else its text mentions. `read` returns a file's bytes, or None."""
+    at = lambda p: canonical(os.path.join(cwd, p))
+    path = tool_input.get('file_path')
+    if tool == 'Write' and isinstance(path, str) and isinstance(tool_input.get('content'), str):
+        return {at(path): hashlib.sha256(tool_input['content'].encode()).hexdigest()}
+    if tool == 'Edit' and isinstance(path, str) and isinstance(tool_input.get('old_string'), str) and isinstance(tool_input.get('new_string'), str):
+        try:
+            text = read(at(path)).decode()
+        except (AttributeError, UnicodeDecodeError):  # no file, or not UTF-8 text: no result this can foretell
+            return {}
+        old, new = tool_input['old_string'], tool_input['new_string']
+        if not old or (text.count(old) != 1 and not (tool_input.get('replace_all') and old in text)):
+            return {}  # the edit will fail, or is ambiguous
+        return {at(path): hashlib.sha256(text.replace(old, new).encode()).hexdigest()}
+    if not isinstance(command, str):
+        return None
+    writes = [(m.start(), m.group(1), m.group(2), (m.group(5) or '').encode()) for m in HEREDOC.finditer(command)]
+    rest = HEREDOC.sub(lambda m: ' ' * len(m.group(0)), command)  # a body's own text is no redirection
+    writes += [(m.start(), m.group(1), m.group(2), None) for m in REDIRECT.finditer(rest)]
+    left = {}
+    for _, how, target, body in sorted(writes, key=lambda w: w[0]):
+        target = target.strip('\'"')
+        if target.startswith('/dev/') or '$' in target:
+            continue
+        p = at(target)
+        before = (left[p] if p in left else read(p) or b'') if how == '>>' else b''
+        left[p] = None if body is None or before is None else before + body
+    return {p: data if data is None else hashlib.sha256(data).hexdigest() for p, data in left.items()}
 
 
 def claim(agent, event, now_ms):
@@ -48,7 +92,11 @@ def claim(agent, event, now_ms):
     record = {'schema': 1, 't_ms': now_ms, 'agent': agent, 'event': event.get('hook_event_name'), 'session': event.get('session_id'),
               'turn': event.get('turn_id'), 'tool': event.get('tool_name'), 'tool_use_id': event.get('tool_use_id'),
               'cwd': cwd, 'command': command or tool_input.get('code'), 'paths': sorted({canonical(os.path.join(cwd, p)) for p in named})}
-    if record['event'] in ('PostToolUse', 'PostToolUseFailure'):  # a failed call ends too, and leaves its files as they are
+    if record['event'] == 'PreToolUse':
+        foretold = expects(record['tool'], tool_input, cwd, command)
+        if foretold is not None:
+            record['expects'] = foretold
+    if record['event'] in ('PostToolUse', 'PostToolUseFailure'):  # a failed call ends too; this samples its files afterwards
         record['sha256'] = {p: sha256(p) for p in record['paths']}
     return record
 

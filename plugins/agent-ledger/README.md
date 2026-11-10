@@ -28,9 +28,11 @@ It needs macOS, and `python3` and `swiftc`, both from Xcode's command-line tools
 - **PARTIAL:** a change the event stream missed, found by a later comparison or by a rescan after macOS dropped file
   events; it can't be attributed.
 
-An agent's call claims only what it left: a file named by the call, or a change under a shell command's folder, and
-only if the file ends up as the call's own hook recorded it. A different version, even a moment later, is someone
-else's. A Codex patch claims only the files it names.
+An agent's call claims only what it is set to write. Before a Write, an Edit or a shell command runs, the plugin works
+out what it will leave: the Write's content, the Edit's result, the files a shell command redirects into. A different
+version, even a moment later, is someone else's. A shell command does not cover its folder: a change it doesn't write
+by its own text is `UNCLAIMED`, with the command named as running at the time. That includes files written by a script
+the command runs, which the plugin can't see into. A Codex patch claims only the files it names.
 
 Checkouts, stashes, merges and commits are counted as git operations, not alerted, when git's own reflog shows the
 content they put there. An agent's `git checkout -- <file>` or `git restore <file>` counts too, when the command names
@@ -44,8 +46,8 @@ trace a stale write wouldn't, so it stays an alert, labelled `git-index`.
 - **Anything between its checks.** `/agent-ledger:check` asks the watcher to compare every file with its last record
   at that moment. A clean comparison is a point-in-time result, not proof that monitoring had no gap: a change made
   and undone between two comparisons, if the event stream missed it, leaves no trace.
-- **Overlapping shell work.** Two agents running shell commands in one folder at the same time can cover each other's
-  writes, because a shell write is attributed to the call whose time window it falls in.
+- **What a script writes.** A file written by a program a shell command runs, not by the command's own redirection, is
+  reported as unclaimed, with the command named. The plugin can't tell that write from an outside one.
 - **Fast or large writes.** Two writes within about 50 ms keep only the last version. Files over 64 MB are not tracked.
 - **Files it can't read.** A file or folder the watcher can't read is skipped, never recorded as deleted, and a check
   says coverage is unknown while it stays unreadable.
