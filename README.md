@@ -99,7 +99,8 @@ lands between them is lost, and the restore itself shows up as an alert.
   minutes without agent activity. The next hook starts it again, and it then compares every file with its last version.
 - **Storage.** Everything is in `~/.agent-ledger`, readable only by you: the claims, the observations, and the kept
   copies of your files. Those include files git ignores, such as `.env`. Only `.git`, `.build`, `node_modules`,
-  `__pycache__` and files over 64 MB are skipped. Nothing is pruned.
+  `__pycache__`, Python virtual environments (any folder holding `pyvenv.cfg`) and files over 64 MB are skipped.
+  Nothing is pruned.
 
 ## What leaves your machine
 

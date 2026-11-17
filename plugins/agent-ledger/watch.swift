@@ -4,15 +4,17 @@
 // HOME/observations.jsonl, so changes made while it was stopped are recorded too ("startup").
 // Git's reflogs (.git/logs/HEAD and .git/logs/refs/stash) are versioned as "vcs" records and .git/index changes are
 // recorded as "vcs" markers (no content), so the reconciler can recognise git operations; nothing else under .git is
-// tracked. When FSEvents reports dropped events (MustScanSubDirs), the subtree
-// is rescanned ("rescan") and the gap is recorded ("gap").
+// tracked. When FSEvents reports dropped events (MustScanSubDirs), the gap is recorded ("gap") and the subtree is
+// compared with its last records ("rescan"): once per subtree however many times it was flagged meanwhile, and
+// hashing only files whose ctime moved since they were last hashed. SIGUSR1 asks for the same recovery of every project.
 // Once a minute, and after the startup comparison, it sweeps each project: it compares every file whose ctime moved
 // since it was last hashed with its last recorded version, and records what the event stream missed ("checkpoint").
 // Then it records a "heartbeat" for the project saying whether the folder could be read. An unreadable folder is
 // not swept, so a folder the watcher cannot see never looks like files were deleted. A sweep leaves a change younger
 // than the event stream's delay to the stream. A check asks for a sweep of one project through HOME/requests and gets
 // a "sweep" record once it is complete (see answer()).
-// Files over 64 MB, and anything under .build, node_modules or __pycache__, are not tracked. HOME is owner-only (0700).
+// Files over 64 MB, and anything under .build, node_modules, __pycache__ or a Python virtual environment (a folder
+// holding pyvenv.cfg), are not tracked. HOME is owner-only (0700).
 // One watcher per HOME: it holds an exclusive lock on HOME/watch.lock, and a second one exits at once. It watches the
 // projects listed in HOME/roots (ROOT arguments are added there), and a project appended later joins without a gap:
 // the stream restarts from the last event it saw. It exits after 30 minutes without agent claims (HOME/claims.jsonl);
@@ -48,7 +50,31 @@ let maxBytes: off_t = 64 << 20
 try FileManager.default.createDirectory(at: versions, withIntermediateDirectories: true, attributes: ownerOnly)
 if !FileManager.default.fileExists(atPath: log.path) { FileManager.default.createFile(atPath: log.path, contents: nil) }
 var last: [String: String] = [:]  // path -> sha256 of its last recorded version ("" when deleted)
-var hashedAt: [String: timespec] = [:]  // path -> its ctime when last hashed
+var hashedAt: [String: timespec] = [:]  // path -> the ctime it had when its content was last captured
+var visited = 0, hashed = 0  // files looked at by scans, and files cloned and hashed, since the start
+var pending = Set<String>()  // subtrees whose events were dropped, waiting for one recovery
+
+/// Whether `path` lies inside the folder `dir`, compared as bytes: `hasPrefix` compares character by character, and on
+/// a path that came from Foundation that made a walk of a project spend most of its time here.
+func under(_ path: String, _ dir: String) -> Bool {
+    let p = path.utf8, d = dir.utf8
+    return p.count > d.count && p.starts(with: d) && p[p.index(p.startIndex, offsetBy: d.count)] == UInt8(ascii: "/")
+}
+func environment(_ dir: String) -> Bool { access(dir + "/pyvenv.cfg", F_OK) == 0 }  // a Python virtual environment
+var vetted = (dir: "", tracked: true)  // the last folder asked about: a walk asks once per folder, not once per file
+/// Whether a path outside .git is one the watcher records: not in HOME, a skipped folder or a virtual environment.
+/// The one policy for events, walks, and the paths of earlier records.
+func tracked(_ path: String) -> Bool {
+    guard let slash = path.utf8.lastIndex(of: UInt8(ascii: "/")) else { return false }
+    let dir = String(path[..<slash])
+    if dir != vetted.dir {
+        var ok = dir != home.path && !under(dir, home.path) && !dir.split(separator: "/").contains { skipped.contains(String($0)) }
+        var up = dir
+        while ok, roots.contains(where: { under(up, $0) }), let cut = up.utf8.lastIndex(of: UInt8(ascii: "/")) { ok = !environment(up); up = String(up[..<cut]) }
+        vetted = (dir, ok)
+    }
+    return vetted.tracked && !skipped.contains(String(path[path.index(after: slash)...]))
+}
 var unreadable = Set<String>()  // tracked files that exist but could not be read
 let grace: TimeInterval = 2  // longer than the event stream takes to report a change (0.6 s at most, measured under load)
 let logged = try Data(contentsOf: log)
@@ -57,6 +83,7 @@ for line in String(decoding: logged, as: UTF8.self).split(separator: "\n") {
           let path = o["path"] as? String else { continue }  // a line cut short, or damaged: not a record (reconcile.py reports it)
     if !["vcs", "gap", "heartbeat", "sweep"].contains(kind) { last[path] = o["sha256"] as? String ?? "" }
 }
+last = last.filter { tracked($0.key) }  // a file recorded before its folder was excluded is no longer compared, so never reads as deleted
 let out = try FileHandle(forWritingTo: log)
 out.seekToEndOfFile()
 if let end = logged.last, end != UInt8(ascii: "\n") { out.write(Data("\n".utf8)) }  // end a line cut short, so the next record stands alone
@@ -82,6 +109,7 @@ func snapshot(_ path: String) -> (sha: String, size: off_t, inode: UInt64)? {
         try? FileManager.default.removeItem(at: temp)
         return nil
     }
+    hashed += 1
     let sha = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     let kept = versions.appendingPathComponent(sha)
     if FileManager.default.fileExists(atPath: kept.path) { try? FileManager.default.removeItem(at: temp) } else { try! FileManager.default.moveItem(at: temp, to: kept) }
@@ -96,23 +124,25 @@ func record(_ path: String, kind: String, flags: [String] = []) {
         if inside == "index" { return write(["kind": "vcs", "path": path, "flags": flags]) }
         guard reflogs.contains(inside) else { return }
         kind = "vcs"
-    } else if path.hasPrefix(home.path + "/") || parts.contains(where: { skipped.contains($0) }) {
+    } else if !tracked(path) {
         return
     }
-    var st = stat()
+    var st = stat(), seen: timespec? = nil
     if lstat(path, &st) == 0 {
         if st.st_mode & S_IFMT != S_IFREG || st.st_size > maxBytes { return }  // not a tracked file
-        if kind == "checkpoint" {  // a sweep records only what the event stream missed
-            // it hashes only what changed since it was last hashed: every write moves ctime, and nothing sets it back
-            if let t = hashedAt[path], t.tv_sec == st.st_ctimespec.tv_sec, t.tv_nsec == st.st_ctimespec.tv_nsec { return }
-            // and leaves a change too recent for the stream to have reported yet, or an agent's write reads as unseen
-            if Date().timeIntervalSince1970 - (Double(st.st_ctimespec.tv_sec) + Double(st.st_ctimespec.tv_nsec) / 1e9) < grace { return }
-        }
-        hashedAt[path] = st.st_ctimespec
+        // Only what changed since its content was last captured is captured again: every write moves ctime, and nothing
+        // sets it back. That holds for an event too, because the clone that captures a file is itself reported as an
+        // event on that file: answered with another clone, every file once edited was cloned and hashed again without end.
+        if let t = hashedAt[path], t.tv_sec == st.st_ctimespec.tv_sec, t.tv_nsec == st.st_ctimespec.tv_nsec { return }
+        // a sweep records only what the event stream missed, so it leaves a change too recent for the stream to have
+        // reported yet, or an agent's write reads as unseen
+        if kind == "checkpoint", Date().timeIntervalSince1970 - (Double(st.st_ctimespec.tv_sec) + Double(st.st_ctimespec.tv_nsec) / 1e9) < grace { return }
+        seen = st.st_ctimespec  // read before the clone: a write in between leaves an older ctime here, and the file is hashed again
     } else if errno != ENOENT {
         return  // it can't be looked at, which is not evidence that it is gone
     }
     let s = snapshot(path)
+    hashedAt[path] = s == nil ? nil : seen  // only a capture that succeeded lets a later sweep or rescan pass the file by
     if s == nil, lstat(path, &st) == 0 { unreadable.insert(path); return }  // there but unreadable: neither a deletion nor a change
     unreadable.remove(path)
     let sha = s?.sha ?? ""  // "" once it no longer exists
@@ -124,9 +154,10 @@ func record(_ path: String, kind: String, flags: [String] = []) {
     write(o)
 }
 
-/// Records every tracked file under `root` that differs from its last recorded version.
-func scan(_ root: String, kind: String) {
-    guard let walker = FileManager.default.enumerator(atPath: root) else { return }  // gone, or not a directory
+/// Records every tracked file under `root` that differs from its last recorded version. Returns the files it found.
+@discardableResult func scan(_ root: String, kind: String) -> Set<String> {
+    var found = Set<String>()
+    guard let walker = FileManager.default.enumerator(atPath: root) else { return found }  // gone, or not a directory
     while let relative = walker.nextObject() as? String {
         let name = (relative as NSString).lastPathComponent
         if name == ".git" { reflogs.forEach { record(root + "/" + relative + "/" + $0, kind: kind) } }
@@ -134,19 +165,24 @@ func scan(_ root: String, kind: String) {
         let path = root + "/" + relative
         var st = stat()
         if lstat(path, &st) == 0, st.st_mode & S_IFMT == S_IFDIR {  // the walker passes over a folder it can't open in silence
+            if environment(path) { walker.skipDescendants(); continue }
             if access(path, R_OK | X_OK) == 0 { unreadable.remove(path) } else { unreadable.insert(path) }
             continue
         }
+        visited += 1
+        found.insert(path)
         record(path, kind: kind)
     }
+    return found
 }
 
 /// Compares every tracked file under `dir` with its last record, deletions included. A sweep leaves a deletion whose
 /// folder changed within `grace` to the event stream, as it does a recent change; `stable` then says it is pending.
 func compare(_ dir: String, kind: String) {
     unreadable = unreadable.filter { path in var st = stat(); return !path.hasPrefix(dir + "/") || lstat(path, &st) == 0 || errno != ENOENT }  // gone
-    scan(dir, kind: kind)
-    for (path, sha) in last where !sha.isEmpty && path.hasPrefix(dir + "/") && !FileManager.default.fileExists(atPath: path) {
+    let found = scan(dir, kind: kind)
+    // not found by the walk: gone, or passed by; record() tells them apart
+    for (path, sha) in last where !sha.isEmpty && !found.contains(path) && under(path, dir) {
         var st = stat()
         if kind == "checkpoint", lstat((path as NSString).deletingLastPathComponent, &st) == 0,
            Date().timeIntervalSince1970 - Double(st.st_mtimespec.tv_sec) < grace { continue }
@@ -163,11 +199,13 @@ func stable(_ dir: String) -> Bool {
         if skipped.contains((relative as NSString).lastPathComponent) { walker.skipDescendants(); continue }
         let path = dir + "/" + relative
         var st = stat()
-        guard !path.hasPrefix(home.path + "/"), lstat(path, &st) == 0, st.st_mode & S_IFMT == S_IFREG, st.st_size <= maxBytes else { continue }
+        guard !path.hasPrefix(home.path + "/"), lstat(path, &st) == 0 else { continue }
+        if st.st_mode & S_IFMT == S_IFDIR, environment(path) { walker.skipDescendants(); continue }
+        guard st.st_mode & S_IFMT == S_IFREG, st.st_size <= maxBytes else { continue }
         guard let t = hashedAt[path], t.tv_sec == st.st_ctimespec.tv_sec, t.tv_nsec == st.st_ctimespec.tv_nsec else { return false }
         present.insert(path)
     }
-    return !last.contains { path, sha in !sha.isEmpty && path.hasPrefix(dir + "/") && !path.contains("/.git/") && !present.contains(path) }
+    return !last.contains { path, sha in !sha.isEmpty && !present.contains(path) && under(path, dir) && !path.contains("/.git/") && tracked(path) }
 }
 
 /// Compares each readable project with its last records, deletions included, then records a heartbeat per project.
@@ -180,6 +218,24 @@ func sweep(kind: String) {
 }
 sweep(kind: "startup")  // anything new, different or gone since the last run
 
+/// Records the gap and asks for one recovery of that subtree, shared with every gap reported before it runs: a
+/// stream that fell behind flags every project, again and again, and each walk it waits on makes it fall further behind.
+func dropped(_ path: String, flags: [String]) {
+    write(["kind": "gap", "path": path, "flags": flags])
+    if pending.isEmpty { later(grace, recover) }
+    pending.insert(path)
+}
+/// Compares each pending subtree with its last records, deletions included, once: a subtree inside another pending one
+/// is covered by it. A gap reported while this runs is pending again, and gets its own recovery.
+func recover() {
+    let all = pending, began = Date(), before = (visited, hashed)
+    pending = []
+    let tops = all.filter { path in !all.contains { $0 != path && path.hasPrefix($0 + "/") } }.sorted()
+    tops.forEach { compare($0, kind: "rescan") }
+    print("recovered \(tops.count) subtree(s): \(visited - before.0) files visited, \(hashed - before.1) hashed (\(hashed) since the start), \(Int(Date().timeIntervalSince(began) * 1000)) ms")
+    fflush(stdout)
+}
+
 let names: [(Int, String)] = [(kFSEventStreamEventFlagItemCreated, "Created"), (kFSEventStreamEventFlagItemRemoved, "Removed"),
     (kFSEventStreamEventFlagItemRenamed, "Renamed"), (kFSEventStreamEventFlagItemModified, "Modified"),
     (kFSEventStreamEventFlagItemInodeMetaMod, "InodeMeta"), (kFSEventStreamEventFlagItemXattrMod, "Xattr"),
@@ -187,12 +243,12 @@ let names: [(Int, String)] = [(kFSEventStreamEventFlagItemCreated, "Created"), (
     (kFSEventStreamEventFlagUserDropped, "UserDropped"), (kFSEventStreamEventFlagKernelDropped, "KernelDropped")]
 let callback: FSEventStreamCallback = { _, _, count, paths, flags, _ in
     let items = Unmanaged<CFArray>.fromOpaque(paths).takeUnretainedValue() as! [[String: Any]]
+    vetted.dir = ""  // a folder may have become a virtual environment since it was last asked about
     for i in 0..<count {
         let path = items[i][kFSEventStreamEventExtendedDataPathKey] as! String
         let named = names.filter { flags[i] & UInt32($0.0) != 0 }.map(\.1)
         if flags[i] & UInt32(kFSEventStreamEventFlagMustScanSubDirs) != 0 {  // events were dropped under this path
-            write(["kind": "gap", "path": path, "flags": named])
-            compare(path, kind: "rescan")  // what changed there, deletions included
+            dropped(path, flags: named)
         } else if flags[i] & UInt32(kFSEventStreamEventFlagItemIsFile) != 0 {
             record(path, kind: "change", flags: named)
         }
@@ -279,5 +335,9 @@ let requested = DispatchSource.makeFileSystemObjectSource(fileDescriptor: open(r
 requested.setEventHandler(handler: answer)
 requested.resume()
 later(0, answer)  // requests made before this watcher started
+signal(SIGUSR1, SIG_IGN)  // the source below receives it instead
+let asked = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: queue)
+asked.setEventHandler { roots.forEach { dropped($0, flags: ["Requested"]) } }
+asked.resume()
 idle.resume()
 dispatchMain()
